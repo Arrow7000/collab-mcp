@@ -173,6 +173,14 @@ together genuinely do race, and refusing there is what forces retry loops.
 Names are **never rewritten**. An invalid or colliding name is an error, not a silent
 substitution.
 
+**Nothing about an agent's identity or location is taken from the agent.** An agent
+supplies only the name it wishes to be known by, and who it is writing to. Which session
+it is, and which project that session works in, both come from the harness: opencode
+reports them on every event, Claude Code in the environment of the server it spawns.
+This is not only about lying — it removes a whole class of mistake, since an agent
+cannot get its own workdir wrong if it is never asked for it. It also means `send` takes
+no `from`: the router resolves the sender from the session that made the call.
+
 **Scope is derived, never configured.** A name is unique within a project, not across
 the machine, so two unrelated repositories cannot collide on `RedStone`. The project
 comes from the harness: opencode puts `location.directory` on every event, and Claude
@@ -183,7 +191,8 @@ endpoint would silently merge every project into one namespace.
 
 Binding `name → endpoint`:
 
-- **Claude Code**: read `CLAUDE_CODE_SESSION_ID` from the shim's environment. Direct.
+- **Claude Code**: read `CLAUDE_CODE_SESSION_ID` and `CLAUDE_PROJECT_DIR` from the
+  shim's environment. Direct; no correlation needed.
 - **opencode**: the agent announces its name; the router matches the
   `session.tool.called` event carrying that call and binds the emitting `sessionID`.
   Note the tool *name* is not on that event — it arrives on the earlier

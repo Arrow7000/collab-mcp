@@ -19,10 +19,18 @@ type Registration =
     { Name: AgentName
       Scope: Scope
       Binding: Binding
-      /// Set when an agent has announced a name but we have not yet seen which session
-      /// it spoke from. Resolved by the next matching `AgentInvoked` event.
-      PendingClaim: ToolInvocation option
       FirstSeen: DateTimeOffset }
+
+/// A name announced by an agent whose session we have not identified yet.
+///
+/// MCP tells a server nothing about its caller, so `hello` cannot know which session
+/// spoke or which project it is in. Both arrive with the `AgentInvoked` event that
+/// reports the same invocation, and only then does a Registration exist. Nothing an
+/// agent says about its own identity or location is ever taken on trust.
+type PendingClaim =
+    { Name: AgentName
+      Invocation: ToolInvocation
+      At: DateTimeOffset }
 
 /// Mail held because nothing is bound to the recipient's name. Ordered, so a session
 /// that binds receives its backlog in the order it was sent.
@@ -35,6 +43,9 @@ type ParkedMail =
 /// The router's whole state. A value, so it can be rebuilt by replaying the log.
 type RouterState =
     { Registrations: Map<string, Registration>
+      /// Announced names awaiting attribution. Not keyed by scope, because the scope is
+      /// one of the things we are still waiting to learn.
+      Pending: PendingClaim list
       Parked: ParkedMail list }
 
 /// The one tunable that survived the cut to a minimal first version.
@@ -77,7 +88,10 @@ module RouterState =
     /// scope/name pairs can collide on one key.
     let private sep = string (char 0x1F)
 
-    let empty: RouterState = { Registrations = Map.empty; Parked = [] }
+    let empty: RouterState =
+        { Registrations = Map.empty
+          Pending = []
+          Parked = [] }
 
     /// Registrations are keyed by scope and name together; a lookup without a scope is
     /// meaningless.
@@ -102,33 +116,30 @@ module Router =
         |> List.filter (fun r -> Scope.key r.Scope = Scope.key scope)
         |> List.sortBy (fun r -> AgentName.key r.Name)
 
-    /// An agent announces the name it is speaking as.
+    /// An agent announces the name it wishes to be known by.
     ///
-    /// The claim is recorded but not bound: MCP cannot tell us which session called, so
-    /// the binding waits for the `AgentInvoked` event reporting this same invocation
-    /// (DESIGN.md §7). The name is reserved meanwhile, so mail can already park for it.
+    /// Deliberately does not take a scope. The agent is not asked where it is, and the
+    /// shim is not asked either: both the project and the session come from the
+    /// `AgentInvoked` event that reports this same invocation, which the harness emits
+    /// and no agent can forge. A name is all the agent contributes.
     let claim
         (now: DateTimeOffset)
-        (scope: Scope)
         (name: AgentName)
         (invocation: ToolInvocation)
         (state: RouterState)
         : RouterState * Intent list =
-        let k = RouterState.key scope name
+        let pending =
+            { Name = name
+              Invocation = invocation
+              At = now }
 
-        let registration =
-            match Map.tryFind k state.Registrations with
-            | Some existing -> { existing with PendingClaim = Some invocation }
-            | None ->
-                { Name = name
-                  Scope = scope
-                  Binding = Unbound
-                  PendingClaim = Some invocation
-                  FirstSeen = now }
-
-        { state with Registrations = Map.add k registration state.Registrations }, []
+        { state with Pending = state.Pending @ [ pending ] }, []
 
     /// The main decision.
+    ///
+    /// `scope` and `from` are resolved by the daemon from the session that made the
+    /// call, never read out of the request: an agent says who it is writing *to*, and
+    /// nothing about who it is.
     let send
         (now: DateTimeOffset)
         (limits: Limits)
@@ -164,30 +175,34 @@ module Router =
         : RouterState * Intent list =
         match event with
         | AgentInvoked(endpoint, invocation) ->
-            let pending =
-                state.Registrations
-                |> Map.toList
-                |> List.tryFind (fun (_, r) ->
-                    Scope.key r.Scope = Scope.key endpoint.Scope
-                    && r.PendingClaim = Some invocation)
-
-            match pending with
+            match state.Pending |> List.tryFind (fun c -> c.Invocation = invocation) with
             | None -> state, []
-            | Some(k, registration) ->
-                let bound =
-                    { registration with
-                        Binding = Bound(endpoint, now)
-                        PendingClaim = None }
+            | Some claimed ->
+                // The scope comes from the event, so it is the harness's account of
+                // where this session is working, not the agent's.
+                let scope = endpoint.Scope
+                let k = RouterState.key scope claimed.Name
+
+                let registration =
+                    { Name = claimed.Name
+                      Scope = scope
+                      Binding = Bound(endpoint, now)
+                      FirstSeen =
+                        state.Registrations
+                        |> Map.tryFind k
+                        |> Option.map (fun r -> r.FirstSeen)
+                        |> Option.defaultValue claimed.At }
 
                 let mine, others =
                     state.Parked
                     |> List.partition (fun p ->
-                        Scope.key p.Scope = Scope.key endpoint.Scope
-                        && AgentName.equivalent p.Envelope.To registration.Name)
+                        Scope.key p.Scope = Scope.key scope
+                        && AgentName.equivalent p.Envelope.To claimed.Name)
 
                 let state2 =
                     { state with
-                        Registrations = Map.add k bound state.Registrations
+                        Registrations = Map.add k registration state.Registrations
+                        Pending = state.Pending |> List.filter (fun c -> c <> claimed)
                         Parked = others }
 
                 let flush =
@@ -196,7 +211,7 @@ module Router =
                     else
                         [ Flush(endpoint, mine |> List.map (fun p -> p.Envelope)) ]
 
-                state2, CompleteClaim(registration.Name, endpoint) :: flush
+                state2, CompleteClaim(claimed.Name, endpoint) :: flush
 
         | SessionEnded endpoint ->
             let bound =
