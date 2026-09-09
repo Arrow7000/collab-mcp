@@ -2,7 +2,7 @@
 
 Peer-to-peer collaboration for coding agents across providers, with **push delivery**.
 
-Status: design agreed, implementation not started. Phase 1 scope is at the bottom.
+Status: P1 built and demonstrated end to end. Phases are at the bottom.
 
 ---
 
@@ -80,10 +80,18 @@ there are no session env vars, and `cwd` is the shared project dir. Worse, the s
 process is a child of the **shared daemon**, not of a session, so one process serves many
 sessions. Process identity does not disambiguate.
 
-**F6. The event bus supplies what MCP lacks.** `session.tool.called` carries both
-`sessionID` and the full tool `input`. Attribution therefore comes from the event
-stream, not from the tool call — the agent never needs to know its session id and
-cannot lie about it.
+**F6. The event bus supplies what MCP lacks.** `session.tool.progress` carries the
+`sessionID`, the tool name and the exact MCP arguments on one event, ~1 ms before the
+server receives the call. Attribution therefore comes from the event stream, not from
+the tool call — the agent never needs to know its session id and cannot lie about it.
+
+Two corrections to an earlier reading of this, both found by building it. The obvious
+candidate, `session.tool.called`, is the wrong event: opencode does not expose MCP tools
+to the model at all, only inside its `execute` sandbox, so that event describes the
+sandbox call and its `input` is JavaScript source. And the progress frames are not
+durable, so a call that begins before the router is listening can never be attributed —
+which is precisely the first call after a cold start, since the harness spawns the stdio
+server as part of it. That call is answered with "call again", and the second succeeds.
 
 **F7. Claude Code is different.** It *does* export `CLAUDE_CODE_SESSION_ID`,
 `CLAUDE_CODE_MESSAGING_SOCKET` and `CLAUDE_CODE_MESSAGING_TOKEN` to stdio MCP servers it
@@ -92,7 +100,8 @@ spawns. So attribution has two shapes: env-based (Claude Code) and event-correla
 attribution is only reliable for directly-spawned servers.
 
 **F8. MCP registration is a static config line.** There is no runtime registration
-protocol. `type: local` servers are spawned **lazily on first tool call**. This is what
+protocol. `type: local` servers are spawned **lazily**, but at session start rather than
+at first call, and a call made before the server is ready simply blocks. This is what
 lets the shim bootstrap the daemon invisibly.
 
 ## 5. Architecture
@@ -117,6 +126,12 @@ name→endpoint registry, the durable queue, and the safety limits. It never ins
 message *content* to make routing decisions, so it cannot become the relay bottleneck
 that the lead-orchestrator model is.
 
+It also owns correlation, and owns the wording of everything an agent is told. The first
+because caller-blindness is an artefact of how MCP is specified rather than a rule about
+who may talk to whom: `Router` is handed a session and decides routing, and never learns
+that the question was hard. The second so that there is one place to read what an agent
+sees, and no way for the two halves to disagree about what a verb means.
+
 **Discovery.** `roster` lists the agents in the asking agent's project, so peers find
 each other without their names being written into their prompts. Only the agent that
 starts *second* needs it: the first does not have to find anyone, because the second
@@ -124,9 +139,16 @@ finds it and sends, and push delivery wakes it. Discovery therefore never has to
 poll. (P2: a `LastActive` stamp and a filter, so a long-lived daemon does not offer up
 every name ever used in a project.)
 
-**Shim** — stdio MCP, deliberately thin: forward calls, no logic worth testing. On first
-call it connects to the daemon's unix socket; if absent, spawns it detached (singleton
-via lockfile) and retries. One config line for the user, no plist, no manual start.
+**Shim** — stdio MCP, deliberately thin: forward calls, no logic worth testing. It
+connects to the daemon's unix socket at startup rather than on first call; if the daemon
+is absent it spawns it detached (singleton via lockfile) and waits. Startup rather than
+first call because the harness starts a stdio server before it will run anything, so the
+wait costs time the model has not yet had — and a daemon started by the first call
+subscribes to the harness after the event that would have attributed that call.
+
+The shim and daemon are one binary, invoked with `--daemon` for the latter. Not
+tidiness: it is what lets the shim start the daemon without a second path to configure or
+keep in step, so the user writes one line and nothing else.
 
 **Adapters** — the only provider-specific code, and the only place beta APIs appear.
 
@@ -194,11 +216,17 @@ Binding `name → endpoint`:
 - **Claude Code**: read `CLAUDE_CODE_SESSION_ID` and `CLAUDE_PROJECT_DIR` from the
   shim's environment. Direct; no correlation needed.
 - **opencode**: the agent announces its name; the router matches the
-  `session.tool.called` event carrying that call and binds the emitting `sessionID`.
-  Note the tool *name* is not on that event — it arrives on the earlier
-  `session.tool.input.started` and is joined on the call id — so the adapter needs both
-  frames to reconstruct one invocation. One correlation at bind time; the mapping is
-  durable and re-bindable when a session restarts.
+  `session.tool.progress` event carrying that call and binds the emitting `sessionID`.
+  Correlation happens on *every* call, not only at bind time, because `send` and `roster`
+  need the caller's identity just as much as `hello` does — that is what lets `send` take
+  no `from`. The mapping itself is durable and re-bindable when a session restarts.
+
+  The correlation key is the tool name and its arguments, and nothing else: everything
+  else about a call is what we are trying to learn. Two calls alike in both are therefore
+  indistinguishable, which is a real if narrow limit — two agents in *different* projects
+  calling `roster()` in the same instant could in principle be answered for each other.
+  Matching is oldest-first. The alternative is to ask the agent for something, which is
+  the thing this design exists to avoid.
 
 Identities outlive sessions. A name is a mailbox, not a process.
 
@@ -233,9 +261,10 @@ first was the main way this design was over-engineered.
 
 ## 10. Phases
 
-- **P1** — domain types, router daemon (SSE + registry + `hello`/`roster`/`send`),
+- **P1** — *done*. Domain types, router daemon (SSE + registry + `hello`/`roster`/`send`),
   opencode adapter, both delivery classes, stdio shim.
-  Demo: two opencode agents on different providers, one idle, woken by the other, no polling.
+  Demo: two opencode agents on different providers, one idle, woken by the other, no
+  polling. Verified as a full round trip — each agent woken from idle by the other.
 - **P2** — durable parking for unbound names, reconnect/reconciliation, rate limits and
   loop-breaking, audit log.
 - **P3** — Claude Code adapter (one namespace across harnesses), file leases,
