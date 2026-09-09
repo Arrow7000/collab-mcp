@@ -50,3 +50,21 @@ module Envelope =
           Body = request.Body
           Urgency = request.Urgency
           SentAt = now }
+
+    /// A message handed back to its sender because nobody claimed the recipient's name.
+    ///
+    /// Addressed from the sender to itself, because there is no third party it could
+    /// honestly come from: inventing a router identity would put a name in the project's
+    /// namespace that an agent could then collide with. The reason and the original text
+    /// both travel, so the sender sees what came back without having to remember what it
+    /// sent.
+    ///
+    /// Always `AtTurnBoundary`: a message that has already waited out its park window is
+    /// not worth interrupting anyone for.
+    let bounce (now: DateTimeOffset) (reason: string) (envelope: Envelope) : Envelope =
+        { Id = MessageId(Guid.NewGuid())
+          From = envelope.From
+          To = envelope.From
+          Body = $"undeliverable to '{AgentName.value envelope.To}': {reason}\n\nyou wrote: {envelope.Body}"
+          Urgency = AtTurnBoundary
+          SentAt = now }

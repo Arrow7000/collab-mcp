@@ -7,6 +7,7 @@
 namespace Collab.Adapters.OpenCode
 
 open System
+open System.Text.Json.Nodes
 open System.Threading
 open Collab.Domain
 
@@ -15,26 +16,28 @@ open Collab.Domain
 /// two facts (Ports.fs) and subscribing to more would invite modelling turn state.
 module EventTypes =
 
-    /// Names a tool call, but carries no input.
+    /// The attribution keystone (DESIGN.md §4, F6).
+    ///
+    /// opencode2 does not expose MCP tools to the model directly: they are reachable
+    /// only from inside the `execute` sandbox, as `tools.<server>.<tool>(args)`. So the
+    /// obvious-looking `session.tool.called` reports the *sandbox* call, and its `input`
+    /// is JavaScript source — the arguments an MCP server actually receives are not in
+    /// it. They surface here instead, alongside the session that sent them.
     [<Literal>]
-    let ToolInputStarted = "session.tool.input.started"
-
-    /// Carries the input and the session, but not the tool name. The attribution
-    /// keystone (DESIGN.md §4, F6).
-    [<Literal>]
-    let ToolCalled = "session.tool.called"
+    let ToolProgress = "session.tool.progress"
 
     /// A session has gone. Its binding must be released.
     [<Literal>]
     let SessionDeleted = "session.deleted"
 
-/// What a single frame tells us, before the two halves of a tool call are joined.
-///
-/// This exists because opencode reports one call as two events: `input.started` names
-/// the tool, `called` carries the input, and neither alone is a `ToolInvocation`.
+/// What a single frame tells us. A list, because one progress frame reports every MCP
+/// call the enclosing sandbox call has made so far, and so can name more than one.
 type Observation =
-    | ToolNamed of callId: string * tool: string
-    | ToolCalled of endpoint: Endpoint * callId: string * input: string
+    /// One MCP tool call, with an identity for the call itself.
+    ///
+    /// The identity is needed because each frame repeats every call reported before it,
+    /// so without one a single call is published again for every later call around it.
+    | McpToolCalled of endpoint: Endpoint * call: string * invocation: ToolInvocation
     | SessionDeleted of endpoint: Endpoint
 
 module Mapping =
@@ -78,26 +81,73 @@ module Mapping =
               Session = SessionId session
               Scope = Scope directory })
 
-    /// Decode one frame. Total: anything we do not act on, or cannot read, is `None`.
-    let observe (frame: EventFrame) : Observation option =
+    /// opencode namespaces an MCP tool as `<server>.<tool>`, where the server half is
+    /// whatever name the user gave it in their config. The router knows the tool it was
+    /// called as and nothing about that config, so the prefix is dropped here — it is
+    /// opencode's convention, and this is the file that owns opencode's conventions.
+    let private bareTool (qualified: string) : string =
+        match qualified.LastIndexOf '.' with
+        | -1 -> qualified
+        | dot -> qualified.Substring(dot + 1)
+
+    /// What identifies one MCP call.
+    ///
+    /// All three parts are load-bearing. `toolCalls` is cumulative and append-only, so
+    /// position within the sandbox call distinguishes the calls inside it. The sandbox
+    /// call's own id would distinguish those lists — except that it is minted by the
+    /// model provider rather than by opencode, and at least one provider issues the
+    /// literal `tool_0` for every call in a session. The assistant step is what actually
+    /// separates them.
+    let private callIdentity (step: string) (callId: string) (index: int) : string =
+        $"{step}#{callId}#{index}"
+
+    /// The MCP calls a progress frame reports as having just started.
+    let private startedIn (data: JsonNode) : (int * ToolInvocation) list =
+        match
+            Json.field "metadata" data
+            |> Option.bind (Json.field "toolCalls")
+        with
+        | Some(:? JsonArray as calls) ->
+            calls
+            |> Seq.indexed
+            |> Seq.choose (fun (index, call) ->
+                match call with
+                | null -> None
+                | entry ->
+                    match Json.stringField "status" entry, Json.stringField "tool" entry with
+                    | Some "running", Some tool ->
+                        // A call with no arguments is reported with no `input` field at
+                        // all, which states the same fact as an empty object. Treating
+                        // the two differently would make an argument-free verb — which
+                        // `roster` is — impossible to attribute.
+                        let input =
+                            Json.field "input" entry
+                            |> Option.map (fun node -> node.ToJsonString())
+                            |> Option.defaultValue "{}"
+
+                        Some(index, { Tool = bareTool tool; Input = input })
+                    | _ -> None)
+            |> Seq.toList
+        | _ -> []
+
+    /// Decode one frame. Total: anything we do not act on, or cannot read, is empty.
+    let observe (frame: EventFrame) : Observation list =
         let field name = Json.stringField name frame.Data
 
         match frame.Type with
-        | EventTypes.ToolInputStarted ->
-            match field "id", field "name" with
-            | Some callId, Some tool -> Some(ToolNamed(callId, tool))
-            | _ -> None
-        | EventTypes.ToolCalled ->
-            match field "sessionID", field "id", Json.field "input" frame.Data with
-            | Some session, Some callId, Some input ->
-                endpointOf frame session
-                |> Option.map (fun endpoint -> ToolCalled(endpoint, callId, input.ToJsonString()))
-            | _ -> None
+        | EventTypes.ToolProgress ->
+            match field "sessionID" |> Option.bind (endpointOf frame), field "id", field "assistantMessageID" with
+            | Some endpoint, Some callId, Some step ->
+                startedIn frame.Data
+                |> List.map (fun (index, invocation) ->
+                    McpToolCalled(endpoint, callIdentity step callId index, invocation))
+            | _ -> []
         | EventTypes.SessionDeleted ->
             field "sessionID"
             |> Option.bind (endpointOf frame)
             |> Option.map SessionDeleted
-        | _ -> None
+            |> Option.toList
+        | _ -> []
 
 module Faults =
 
@@ -111,34 +161,28 @@ module Faults =
         | ApiError.SessionNotFound _ -> SessionGone endpoint
         | ApiError.Rejected(status, detail) -> HarnessRejected(status, detail)
 
-/// Tool names awaiting their call.
+/// Sandbox calls we have already reported.
 ///
-/// opencode never repeats the name on the event that carries the input, so a name is
-/// held from `session.tool.input.started` until the matching `session.tool.called`.
-/// Bounded, because a call whose second half never arrives — an interrupted turn, a
-/// dropped frame — would otherwise leak a name for the life of the daemon.
-type internal ToolNames(capacity: int) =
+/// Every progress frame restates the MCP calls before it, so without this one call
+/// would be published as many times as the sandbox around it makes further calls.
+/// Bounded, because the alternative is a table that grows for the life of the daemon.
+type internal Reported(capacity: int) =
     let gate = obj ()
-    let names = System.Collections.Generic.Dictionary<string, string>()
+    let seen = System.Collections.Generic.HashSet<string>()
     let arrival = System.Collections.Generic.Queue<string>()
 
-    member _.Remember(callId: string, tool: string) =
+    /// True the first time a given call is offered, false afterwards.
+    member _.IsNew(key: string) : bool =
         lock gate (fun () ->
-            if names.TryAdd(callId, tool) then
-                arrival.Enqueue callId
+            if seen.Add key then
+                arrival.Enqueue key
 
                 while arrival.Count > capacity do
-                    names.Remove(arrival.Dequeue()) |> ignore)
+                    seen.Remove(arrival.Dequeue()) |> ignore
 
-    /// Names are consumed: one call has one name, and keeping it afterwards only
-    /// grows the table.
-    member _.Take(callId: string) : string option =
-        lock gate (fun () ->
-            match names.TryGetValue callId with
-            | true, tool ->
-                names.Remove callId |> ignore
-                Some tool
-            | _ -> None)
+                true
+            else
+                false)
 
 /// Multicast for the event stream.
 ///
@@ -177,9 +221,10 @@ type OpenCodeAdapter private (client: OpenCodeClient, ownsClient: bool) =
     /// spin against a daemon that is down, short enough that a restart is invisible.
     let reconnectDelayMs = 1000
 
-    /// Enough for the tool calls in flight across every session at once; overrun
-    /// costs an unnamed tool, not a lost event.
-    let names = ToolNames 512
+    /// Enough for the sandbox calls in flight across every session at once. Overrun
+    /// costs a duplicate report, which attribution then consumes against a call that
+    /// has already been answered — so it is sized generously.
+    let reported = Reported 4096
 
     let events = Broadcast<HarnessEvent>()
     let cancellation = new CancellationTokenSource()
@@ -187,16 +232,12 @@ type OpenCodeAdapter private (client: OpenCodeClient, ownsClient: bool) =
     let mutable pumping = false
 
     let handle (frame: EventFrame) =
-        match Mapping.observe frame with
-        | Some(ToolNamed(callId, tool)) -> names.Remember(callId, tool)
-        | Some(ToolCalled(endpoint, callId, input)) ->
-            // No remembered name means we joined mid-call. The attribution is still
-            // worth publishing — the router correlates a claim by its input — so the
-            // tool is reported unnamed rather than the event dropped.
-            let tool = names.Take callId |> Option.defaultValue ""
-            events.Publish(AgentInvoked(endpoint, { Tool = tool; Input = input }))
-        | Some(SessionDeleted endpoint) -> events.Publish(SessionEnded endpoint)
-        | None -> ()
+        for observation in Mapping.observe frame do
+            match observation with
+            | McpToolCalled(endpoint, call, invocation) ->
+                if reported.IsNew call then
+                    events.Publish(AgentInvoked(endpoint, invocation))
+            | SessionDeleted endpoint -> events.Publish(SessionEnded endpoint)
 
     let rec pump () =
         async {

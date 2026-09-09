@@ -21,17 +21,6 @@ type Registration =
       Binding: Binding
       FirstSeen: DateTimeOffset }
 
-/// A name announced by an agent whose session we have not identified yet.
-///
-/// MCP tells a server nothing about its caller, so `hello` cannot know which session
-/// spoke or which project it is in. Both arrive with the `AgentInvoked` event that
-/// reports the same invocation, and only then does a Registration exist. Nothing an
-/// agent says about its own identity or location is ever taken on trust.
-type PendingClaim =
-    { Name: AgentName
-      Invocation: ToolInvocation
-      At: DateTimeOffset }
-
 /// Mail held because nothing is bound to the recipient's name. Ordered, so a session
 /// that binds receives its backlog in the order it was sent.
 type ParkedMail =
@@ -43,9 +32,6 @@ type ParkedMail =
 /// The router's whole state. A value, so it can be rebuilt by replaying the log.
 type RouterState =
     { Registrations: Map<string, Registration>
-      /// Announced names awaiting attribution. Not keyed by scope, because the scope is
-      /// one of the things we are still waiting to learn.
-      Pending: PendingClaim list
       Parked: ParkedMail list }
 
 /// The one tunable that survived the cut to a minimal first version.
@@ -64,7 +50,12 @@ type Intent =
     /// The hold expired without anyone claiming the name. Wake the *sender* and tell it,
     /// so an unroutable message surfaces through the same push path as any other rather
     /// than vanishing.
-    | ReturnToSender of envelope: Envelope * reason: string
+    ///
+    /// Carries the sender's endpoint rather than leaving it to be looked up: only the
+    /// router knows where that name is bound, and a sender that has itself gone away in
+    /// the meantime has nowhere to be told, which is a decision worth making here where
+    /// it is testable rather than at the point of performing IO.
+    | ReturnToSender of to': Endpoint * envelope: Envelope * reason: string
     /// Tell the sender no, with a reason it can act on.
     | Decline of Refusal
     /// Bind a name to the session that just proved it owns it.
@@ -89,9 +80,7 @@ module RouterState =
     let private sep = string (char 0x1F)
 
     let empty: RouterState =
-        { Registrations = Map.empty
-          Pending = []
-          Parked = [] }
+        { Registrations = Map.empty; Parked = [] }
 
     /// Registrations are keyed by scope and name together; a lookup without a scope is
     /// meaningless.
@@ -100,6 +89,17 @@ module RouterState =
 
     let lookup (scope: Scope) (name: AgentName) (state: RouterState) : Registration option =
         Map.tryFind (key scope name) state.Registrations
+
+    /// Which identity a session currently owns.
+    ///
+    /// This is the reverse of the lookup above, and it is how a call gets a sender: the
+    /// harness says which session spoke, and this says which name that session answers
+    /// to. An agent is therefore never asked who it is.
+    let boundTo (endpoint: Endpoint) (state: RouterState) : Registration option =
+        state.Registrations
+        |> Map.toSeq
+        |> Seq.map snd
+        |> Seq.tryFind (fun r -> Binding.endpoint r.Binding = Some endpoint)
 
 module Router =
 
@@ -118,22 +118,51 @@ module Router =
 
     /// An agent announces the name it wishes to be known by.
     ///
-    /// Deliberately does not take a scope. The agent is not asked where it is, and the
-    /// shim is not asked either: both the project and the session come from the
-    /// `AgentInvoked` event that reports this same invocation, which the harness emits
-    /// and no agent can forge. A name is all the agent contributes.
+    /// The endpoint is not a parameter the agent could ever influence. MCP tells a
+    /// server nothing about its caller, so the daemon recovers the calling session from
+    /// the harness's own event stream before it gets here (Ports.fs), and by this point
+    /// the session and its project are facts the harness reported. A name is the whole
+    /// of what the agent contributes.
+    ///
+    /// Rebinding is deliberate rather than an error: an identity outlives a session, so
+    /// a restarted agent announcing the same name takes its mailbox back, along with
+    /// anything that parked while it was away.
     let claim
         (now: DateTimeOffset)
         (name: AgentName)
-        (invocation: ToolInvocation)
+        (endpoint: Endpoint)
         (state: RouterState)
         : RouterState * Intent list =
-        let pending =
-            { Name = name
-              Invocation = invocation
-              At = now }
+        let scope = endpoint.Scope
+        let k = RouterState.key scope name
 
-        { state with Pending = state.Pending @ [ pending ] }, []
+        let registration =
+            { Name = name
+              Scope = scope
+              Binding = Bound(endpoint, now)
+              FirstSeen =
+                state.Registrations
+                |> Map.tryFind k
+                |> Option.map (fun r -> r.FirstSeen)
+                |> Option.defaultValue now }
+
+        let mine, others =
+            state.Parked
+            |> List.partition (fun p ->
+                Scope.key p.Scope = Scope.key scope && AgentName.equivalent p.Envelope.To name)
+
+        let state' =
+            { state with
+                Registrations = Map.add k registration state.Registrations
+                Parked = others }
+
+        let flush =
+            if List.isEmpty mine then
+                []
+            else
+                [ Flush(endpoint, mine |> List.map (fun p -> p.Envelope)) ]
+
+        state', CompleteClaim(name, endpoint) :: flush
 
     /// The main decision.
     ///
@@ -166,65 +195,22 @@ module Router =
 
                 { state with Parked = state.Parked @ [ parked ] }, [ Park(envelope, until) ]
 
-    /// Fold a harness fact into the state: match a pending claim to its session and
-    /// flush anything waiting for it, or release a dead session's binding.
-    let observe
-        (now: DateTimeOffset)
-        (event: HarnessEvent)
-        (state: RouterState)
-        : RouterState * Intent list =
+    /// Fold a harness fact into the state.
+    ///
+    /// Only one of the two facts changes routing. `AgentInvoked` exists so that a
+    /// caller-blind MCP call can be attributed to a session, and that correlation is
+    /// the daemon's: it is an artefact of how MCP is specified, not a rule about who
+    /// may talk to whom, and by the time `claim` or `send` is called the answer is
+    /// already an argument.
+    let observe (event: HarnessEvent) (state: RouterState) : RouterState * Intent list =
         match event with
-        | AgentInvoked(endpoint, invocation) ->
-            match state.Pending |> List.tryFind (fun c -> c.Invocation = invocation) with
-            | None -> state, []
-            | Some claimed ->
-                // The scope comes from the event, so it is the harness's account of
-                // where this session is working, not the agent's.
-                let scope = endpoint.Scope
-                let k = RouterState.key scope claimed.Name
-
-                let registration =
-                    { Name = claimed.Name
-                      Scope = scope
-                      Binding = Bound(endpoint, now)
-                      FirstSeen =
-                        state.Registrations
-                        |> Map.tryFind k
-                        |> Option.map (fun r -> r.FirstSeen)
-                        |> Option.defaultValue claimed.At }
-
-                let mine, others =
-                    state.Parked
-                    |> List.partition (fun p ->
-                        Scope.key p.Scope = Scope.key scope
-                        && AgentName.equivalent p.Envelope.To claimed.Name)
-
-                let state2 =
-                    { state with
-                        Registrations = Map.add k registration state.Registrations
-                        Pending = state.Pending |> List.filter (fun c -> c <> claimed)
-                        Parked = others }
-
-                let flush =
-                    if List.isEmpty mine then
-                        []
-                    else
-                        [ Flush(endpoint, mine |> List.map (fun p -> p.Envelope)) ]
-
-                state2, CompleteClaim(claimed.Name, endpoint) :: flush
+        | AgentInvoked _ -> state, []
 
         | SessionEnded endpoint ->
-            let bound =
-                state.Registrations
-                |> Map.toList
-                |> List.tryFind (fun (_, r) ->
-                    match r.Binding with
-                    | Bound(endpoint = e) -> e = endpoint
-                    | Unbound -> false)
-
-            match bound with
+            match RouterState.boundTo endpoint state with
             | None -> state, []
-            | Some(k, registration) ->
+            | Some registration ->
+                let k = RouterState.key registration.Scope registration.Name
                 let released = { registration with Binding = Unbound }
 
                 { state with Registrations = Map.add k released state.Registrations },
@@ -235,10 +221,19 @@ module Router =
     let expire (now: DateTimeOffset) (state: RouterState) : RouterState * Intent list =
         let dead, live = state.Parked |> List.partition (fun p -> p.ExpiresAt <= now)
 
-        { state with Parked = live },
-        dead
-        |> List.map (fun p ->
-            ReturnToSender(
-                p.Envelope,
-                $"no agent claimed the name '{AgentName.value p.Envelope.To}' in time"
-            ))
+        // A sender that has itself gone away cannot be told anything, so its mail is
+        // simply dropped. Holding it further would only wait on a session that no
+        // longer exists.
+        let returns =
+            dead
+            |> List.choose (fun p ->
+                RouterState.lookup p.Scope p.Envelope.From state
+                |> Option.bind (fun r -> Binding.endpoint r.Binding)
+                |> Option.map (fun sender ->
+                    ReturnToSender(
+                        sender,
+                        p.Envelope,
+                        $"no agent claimed the name '{AgentName.value p.Envelope.To}' in time"
+                    )))
+
+        { state with Parked = live }, returns
