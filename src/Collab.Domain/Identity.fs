@@ -19,10 +19,12 @@ type NameError =
 
 /// The agent runtimes we can deliver into. Each has its own attribution mechanism
 /// and its own delivery API; both live behind `HarnessPort`.
+///
+/// Only runtimes we actually support belong here, so that exhaustive matches stay
+/// meaningful. Others are added when their adapter is.
 type HarnessKind =
     | OpenCode
     | ClaudeCode
-    | Codex
 
 /// A harness-assigned conversation handle, opaque to the domain. We never parse it;
 /// only the owning adapter understands its shape.
@@ -33,6 +35,14 @@ type Endpoint = { Harness: HarnessKind; Session: SessionId }
 
 /// Where a name currently points. `Unbound` is a first-class state, not an error:
 /// mail for an unbound name parks until a session claims it (DESIGN.md §6).
+///
+/// A name binds to at most one endpoint. Where an agent "lives" is the harness's
+/// concern, and session ids do not collide across directories, so a second concurrent
+/// worker is a second name rather than a second binding.
+///
+/// `Bound` says nothing about whether the session is currently executing. A session
+/// that has finished its turn is still bound, and is still deliverable — waking it is
+/// the point (see Delivery.fs on `Parked`).
 type Binding =
     | Unbound
     | Bound of endpoint: Endpoint * since: DateTimeOffset

@@ -53,7 +53,9 @@ type Intent =
     | CompleteClaim of name: AgentName * endpoint: Endpoint
     /// Release a binding whose session has gone, re-parking anything undelivered.
     | ReleaseBinding of name: AgentName
-    /// Deliver a backlog to a session that has just bound or gone idle.
+    /// Deliver a parked backlog, in send order, to a session that has just bound.
+    /// Binding is the only trigger: an already-bound session is delivered to directly,
+    /// idle or not.
     | Flush of endpoint: Endpoint * envelopes: Envelope list
 
 module Limits =
@@ -96,7 +98,8 @@ module Router =
         failwith "TODO"
 
     /// Fold a harness fact into the state. This is where a pending claim is matched
-    /// to its session, and where going idle releases parked mail.
+    /// to its session (flushing anything parked for that name), and where a dead
+    /// session's binding is released.
     let observe
         (now: DateTimeOffset)
         (event: HarnessEvent)

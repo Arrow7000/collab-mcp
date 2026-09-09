@@ -139,6 +139,17 @@ with the agent told to end its turn. The session persists server-side, so haltin
 free and loses nothing; the reply wakes it. This avoids both the polling loop and the
 model's habit of narrating "I have asked and will not await a reply".
 
+**Idle is not a delivery state.** An idle session is live, and delivering to it wakes it
+(F2) — that is the entire point of the system. Mail *parks* only when nothing is bound
+to the recipient's name: the agent has not started, or its session ended. Parked mail
+flushes when a session claims the name.
+
+**The router does not track turn boundaries.** Every harness we support implements that
+itself: opencode chooses between `queue` and `steer` internally, and Claude Code
+delivers between tool calls or starts a new turn. Modelling turn state in the router
+would duplicate the runtime and get it subtly wrong, so `HarnessEvent` carries no
+"went idle" case.
+
 ## 7. Identity and attribution
 
 Names are chosen by the user or the agent and are **never rewritten**. An invalid or

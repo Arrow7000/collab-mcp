@@ -20,16 +20,20 @@ open System
 /// arrive here as the same fact.
 type ToolInvocation = { Tool: string; Input: string }
 
-/// What a harness tells us about its sessions. The minimum the router needs to keep
-/// bindings honest and to know when a parked message can move.
+/// What a harness tells us about its sessions.
+///
+/// Deliberately only two facts. There is no "went idle" event, because the router does
+/// not track turn boundaries: every harness we support already implements that itself
+/// — opencode chooses between `queue` and `steer` delivery internally, and Claude Code
+/// delivers between tool calls or starts a new turn. Modelling turn state here would
+/// duplicate the runtime and get it subtly wrong. The router only needs to know who is
+/// speaking, and when a binding dies.
 type HarnessEvent =
-    /// An agent invoked a tool. Carries the endpoint, so a `hello` can be matched to
-    /// its session.
+    /// An agent invoked a tool. Carries the endpoint, so a claim can be matched to
+    /// the session that made it.
     | AgentInvoked of endpoint: Endpoint * invocation: ToolInvocation
-    /// The session finished its turn and is now idle. A parked or boundary-delivery
-    /// message becomes deliverable here.
-    | WentIdle of endpoint: Endpoint
-    /// The session no longer exists. Its binding must be dropped.
+    /// The session no longer exists. Its binding must be dropped and anything
+    /// undelivered re-parked.
     | SessionEnded of endpoint: Endpoint
 
 /// One agent runtime we can observe and deliver into.
@@ -41,8 +45,11 @@ type HarnessPort =
 
     abstract Kind: HarnessKind
 
-    /// Push an envelope into a live session, waking it if idle. Implementations must
-    /// present it as distinct from a user turn, so provenance survives (DESIGN.md §3).
+    /// Push an envelope into a bound session, waking it if it is idle.
+    ///
+    /// Implementations must present it as distinct from a user turn, so provenance
+    /// survives (DESIGN.md §3), and must honour `Urgency` using whatever the runtime
+    /// provides rather than by holding the message here.
     abstract Deliver: endpoint: Endpoint * envelope: Envelope -> Async<Result<unit, DeliveryFault>>
 
     /// Long-lived stream of session lifecycle facts.

@@ -37,8 +37,17 @@ type DeliveryFault =
 type DeliveryOutcome =
     /// Handed to the recipient's runtime. For `Interrupt` this means it landed
     /// mid-turn; for `AtTurnBoundary` that it is committed to arrive at the boundary.
+    ///
+    /// This is the outcome for an idle recipient too: an idle session is live, and
+    /// delivering to it wakes it. Waking idle agents is the point of the system, not
+    /// an edge case.
     | Delivered of at: DateTimeOffset
-    /// The recipient is known but has no live session. Held until one binds.
+    /// The recipient's name is registered but nothing is bound to it: the agent has
+    /// not started yet, or its session has ended. Held until a session claims the
+    /// name, then flushed in order.
+    ///
+    /// Note this is strictly about the *absence of a binding*. An idle session is not
+    /// parked; it is `Delivered` to.
     | Parked of since: DateTimeOffset
     | Refused of Refusal
     | Failed of DeliveryFault
