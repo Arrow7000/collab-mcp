@@ -24,18 +24,22 @@ $ ps -o command -p 83151
 
 ## Endpoints that matter
 
+Every route below is under `/api`. `GET /openapi.json` is the exception and sits at the
+root. The spec declares `"security": []` on every path, which is **misleading**: basic
+auth is genuinely required, and an unauthenticated `GET /api/session` returns 401.
+
 | Endpoint | Meaning |
 |---|---|
-| `POST /session/{id}/synthetic` | Admit input that is not a user turn; schedules execution |
-| `POST /session/{id}/prompt` | Admit a user turn |
+| `POST /api/session/{id}/synthetic` | Admit input that is not a user turn; schedules execution |
+| `POST /api/session/{id}/prompt` | Admit a user turn |
 | `delivery: "steer" \| "queue"` | Interrupt mid-turn, or hold to turn boundary |
-| `POST /session/{id}/inbox/{item}/steer` | Promote an already-queued item to interrupt |
-| `POST /session/{id}/interrupt` | Hard stop; `continue=true` resumes pending steering |
-| `GET /session/{id}/inbox` | Durable enqueued work not yet delivered |
-| `GET /event` (SSE) | `session.idle`, `session.step.ended`, `session.tool.called`, … |
-| `POST /session/{id}/wait` | Block until the session is idle |
-| `GET /session/active` | Currently running sessions |
-| `PUT /session/{id}/instructions/entries/{key}` | Durable instruction entry, announced at next step boundary |
+| `POST /api/session/{id}/inbox/{item}/steer` | Promote an already-queued item to interrupt |
+| `POST /api/session/{id}/interrupt` | Hard stop; `continue=true` resumes pending steering |
+| `GET /api/session/{id}/inbox` | Durable enqueued work not yet delivered |
+| `GET /api/event` (SSE) | `session.idle`, `session.step.ended`, `session.tool.called`, … |
+| `POST /api/session/{id}/wait` | Block until the session is idle |
+| `GET /api/session/active` | Currently running sessions |
+| `PUT /api/session/{id}/instructions/entries/{key}` | Durable instruction entry, announced at next step boundary |
 
 ## Verified: synthetic wakes an idle session
 
@@ -85,11 +89,25 @@ Consequence: process identity, cwd and clientInfo are all useless for attributio
 ```
 data.sessionID          ses_…
 data.assistantMessageID msg_…
+data.id                 the tool-call id
 data.input              (full tool input object)
 ```
 
-So a router subscribed to `GET /event` can attribute any MCP tool call to its originating
-session by matching the input. This is the keystone of the design.
+So a router subscribed to `GET /api/event` can attribute any MCP tool call to its
+originating session by matching the input. This is the keystone of the design.
+
+**It does not carry the tool name.** The name arrives earlier, on
+`session.tool.input.started` (`{sessionID, assistantMessageID, id, name}`), and must be
+joined to the call on `data.id`. So reconstructing one logical "an agent invoked X" fact
+needs *two* events, and anything filtering by tool name depends on having seen the first
+of them. Matching on input alone is unaffected.
+
+The synthetic response is `{"data": {id: "msg_…", sessionID, timeCreated, type:
+"synthetic", payload, delivery}}`. Keep `data.id`: it is the handle that
+`POST /api/session/{id}/inbox/{item}/steer` takes to promote a queued item later.
+
+SSE frames carry the event type twice — on the `event:` line and as `type` inside the
+JSON payload. Prefer the payload's.
 
 ## Verified: Claude Code is the opposite
 

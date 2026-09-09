@@ -1,0 +1,6 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/Collab.Adapters.OpenCode/Collab.Adapters.OpenCode.fsproj" />
+    <Project Path="src/Collab.Domain/Collab.Domain.fsproj" />
+  </Folder>
+</Solution>
