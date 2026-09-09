@@ -24,8 +24,8 @@ The fix is not a better inbox. It is to stop exposing an inbox to the model at a
 
 > **The inbox belongs to the runtime, not to the agent.**
 
-Agents get one verb: `send`. There is no `fetch`, no `check_mail`, no protocol to
-remember. Mail arrives on the same path a user message arrives on, so an agent can no
+Agents get three verbs: `hello` to announce a name, `roster` to see who else is in the
+project, and `send`. There is no `fetch`, no `check_mail`, no protocol to remember. Mail arrives on the same path a user message arrives on, so an agent can no
 more forget to read it than it can forget to read its prompt.
 
 Every ergonomic complaint above is downstream of exposing `fetch` to the model.
@@ -117,6 +117,13 @@ name→endpoint registry, the durable queue, and the safety limits. It never ins
 message *content* to make routing decisions, so it cannot become the relay bottleneck
 that the lead-orchestrator model is.
 
+**Discovery.** `roster` lists the agents in the asking agent's project, so peers find
+each other without their names being written into their prompts. Only the agent that
+starts *second* needs it: the first does not have to find anyone, because the second
+finds it and sends, and push delivery wakes it. Discovery therefore never has to wait or
+poll. (P2: a `LastActive` stamp and a filter, so a long-lived daemon does not offer up
+every name ever used in a project.)
+
 **Shim** — stdio MCP, deliberately thin: forward calls, no logic worth testing. On first
 call it connects to the daemon's unix socket; if absent, spawns it detached (singleton
 via lockfile) and retries. One config line for the user, no plist, no manual start.
@@ -188,6 +195,13 @@ Identities outlive sessions. A name is a mailbox, not a process.
 
 ## 8. Safety
 
+**Deferred to P2, deliberately.** The rules below are real requirements, but there is no
+traffic to protect until the thing works end to end, and every one of them can be added
+without disturbing delivery. The first version ships with a single refusal
+(`SelfAddressed`) and a single limit (the park deadline). Building the safety machinery
+first was the main way this design was over-engineered.
+
+
 - **Loop breaking** — rate-limit per sender→recipient pair, drop identical repeats within
   a window, cap queue depth. Two agents steering each other forever is otherwise real.
 - **Interrupt budget** — `Interrupt` is rationed. If anything can interrupt at will,
@@ -210,8 +224,8 @@ Identities outlive sessions. A name is a mailbox, not a process.
 
 ## 10. Phases
 
-- **P1** — domain types, router daemon (SSE + registry + `hello`/`send`), opencode
-  adapter, both delivery classes, stdio shim.
+- **P1** — domain types, router daemon (SSE + registry + `hello`/`roster`/`send`),
+  opencode adapter, both delivery classes, stdio shim.
   Demo: two opencode agents on different providers, one idle, woken by the other, no polling.
 - **P2** — durable parking for unbound names, reconnect/reconciliation, rate limits and
   loop-breaking, audit log.

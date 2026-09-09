@@ -56,17 +56,12 @@ module Mapping =
     /// is, and the model sees only the text. The sender's name therefore goes in the
     /// body, and the description carries it again for the UI.
     ///
-    /// A reply names the message it answers, because the domain lets a recipient
-    /// correlate one (`InReplyTo`) and it cannot do so from a body that never said.
+    /// The sender's name is all a recipient needs to answer, so there is no thread or
+    /// reply-to to render yet.
     let render (envelope: Envelope) : SyntheticMessage =
         let sender = AgentName.value envelope.From
 
-        let attribution =
-            match envelope.InReplyTo with
-            | Some(MessageId original) -> $"[peer {sender}, replying to {original}]"
-            | None -> $"[peer {sender}]"
-
-        { Text = $"{attribution}: {envelope.Body}"
+        { Text = $"[peer {sender}]: {envelope.Body}"
           Description = Some $"peer message from {sender}"
           Delivery = delivery envelope.Urgency }
 
