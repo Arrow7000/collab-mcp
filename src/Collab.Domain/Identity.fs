@@ -30,11 +30,24 @@ type HarnessKind =
 /// only the owning adapter understands its shape.
 type SessionId = SessionId of string
 
+/// Secret minted with a name and handed to whoever will run that agent. Presenting it
+/// is what proves entitlement to the name.
+///
+/// This is why an agent cannot squat a peer's identity, and why binding does not have
+/// to resort to comparing serialised tool arguments: the token is unguessable, so a
+/// claim either matches exactly or is rejected.
+type ClaimToken = ClaimToken of string
+
 /// A live destination: a session, in a harness, that we can deliver to.
 type Endpoint = { Harness: HarnessKind; Session: SessionId }
 
-/// Where a name currently points. `Unbound` is a first-class state, not an error:
-/// mail for an unbound name parks until a session claims it (DESIGN.md §6).
+/// Where a name currently points.
+///
+/// Names are *minted* by the router before any session exists, so `Unbound` means
+/// something precise: this agent has been enlisted but has not claimed its name yet,
+/// or has claimed it and since gone. It never means "no idea who that is" — an
+/// unminted name is rejected outright, which is only sound because the router is the
+/// allocator (DESIGN.md §7).
 ///
 /// A name binds to at most one endpoint. Where an agent "lives" is the harness's
 /// concern, and session ids do not collide across directories, so a second concurrent

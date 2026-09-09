@@ -8,14 +8,21 @@ namespace Collab.Domain
 
 open System
 
-/// What the router knows about one identity.
+/// What the router knows about one identity, from the moment it is minted.
+///
+/// A Registration exists before any agent does: enlisting creates it, claiming binds
+/// it. That ordering is what lets an unminted name be rejected outright while a minted
+/// one parks.
 type Registration =
     { Name: AgentName
+      /// Proves entitlement to this name. Never leaves the router except to whoever
+      /// enlisted the agent, who passes it to the agent itself.
+      Token: ClaimToken
       Binding: Binding
-      /// Set when the agent has announced itself but we have not yet matched the
-      /// announcement to a session. Resolved by the next matching `AgentInvoked`.
-      PendingClaim: ToolInvocation option
-      FirstSeen: DateTimeOffset }
+      /// Set when an agent has presented a valid token but we have not yet seen which
+      /// session it spoke from. Resolved by the next `AgentInvoked` event.
+      PendingClaim: ClaimToken option
+      EnlistedAt: DateTimeOffset }
 
 /// Mail held for a name with no live session. Ordered, so a session that binds
 /// receives a backlog in the order it was sent.
@@ -71,6 +78,8 @@ type Intent =
     | ReturnToSender of envelope: Envelope * reason: string
     /// Tell the sender no, with a reason it can act on.
     | Decline of Refusal
+    /// Hand a freshly minted identity back to whoever enlisted it.
+    | Enlisted of name: AgentName * token: ClaimToken
     /// Bind a name to the session that just proved it owns it.
     | CompleteClaim of name: AgentName * endpoint: Endpoint
     /// Release a binding whose session has gone, re-parking anything undelivered.
@@ -102,15 +111,27 @@ module RouterState =
 
 module Router =
 
-    /// An agent announces which identity it is speaking as. The claim is not trusted
-    /// until an `AgentInvoked` event attributes it to a session, which is what stops
-    /// an agent claiming a name it does not own (DESIGN.md §7).
+    /// Mint an identity. Called before the agent exists — by a lead about to spawn
+    /// subagents, or by a human at the CLI setting up a run of top-level peers. The
+    /// name becomes addressable immediately, so a peer that starts first can send to
+    /// it and have the message park rather than bounce.
+    let enlist
+        (now: DateTimeOffset)
+        (name: AgentName)
+        (token: ClaimToken)
+        (state: RouterState)
+        : Result<RouterState * Intent list, Refusal> =
+        failwith "TODO"
+
+    /// An agent presents its token to take up its identity. The claim is not bound
+    /// until an `AgentInvoked` event says which session it came from: the token
+    /// establishes *who*, the event establishes *where* (DESIGN.md §7).
     let claim
         (now: DateTimeOffset)
         (name: AgentName)
-        (invocation: ToolInvocation)
+        (token: ClaimToken)
         (state: RouterState)
-        : RouterState * Intent list =
+        : Result<RouterState * Intent list, Refusal> =
         failwith "TODO"
 
     /// The main decision. Total in the outcome: every rejection path is a `Refusal`

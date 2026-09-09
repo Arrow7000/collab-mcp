@@ -152,16 +152,31 @@ would duplicate the runtime and get it subtly wrong, so `HarnessEvent` carries n
 
 ## 7. Identity and attribution
 
-Names are chosen by the user or the agent and are **never rewritten**. An invalid or
-colliding name is an error, not a silent substitution.
+**The router allocates names.** An identity is *minted* before the agent that will use
+it exists — by a lead about to spawn subagents, or by a human at the CLI setting up a
+run of top-level peers. Minting returns the name and a `ClaimToken`, which is passed to
+the agent and proves entitlement when it claims the name.
+
+This ordering is what makes addressing honest. A name the router never minted cannot be
+a peer that is merely slow to start, so it is rejected immediately as misaddressed. A
+name it did mint, but which nothing is bound to yet, is a known agent that is not ready
+— so mail parks. Without the router as allocator those two cases are indistinguishable,
+and every unknown name has to be given the benefit of the doubt.
+
+Names are **never rewritten**. An invalid or colliding name is an error, not a silent
+substitution.
+
+Because identities must exist before use, enlisting needs a CLI path as well as an MCP
+verb: a lead can mint names for the subagents it spawns, but two top-level peers have no
+lead to do it for them.
 
 Binding `name → endpoint`:
 
 - **Claude Code**: read `CLAUDE_CODE_SESSION_ID` from the shim's environment. Direct.
-- **opencode**: the agent calls `hello(name)`; the router matches the
-  `session.tool.called` event carrying that exact input within a short window and binds
-  the emitting `sessionID`. One correlation at bind time; the mapping is then durable
-  and re-bindable when a session restarts.
+- **opencode**: the agent claims its name with its token; the router then matches the
+  `session.tool.called` event from that claim and binds the emitting `sessionID`. The
+  token establishes *who*, the event establishes *where*. One correlation at bind time;
+  the mapping is durable and re-bindable when a session restarts.
 
 Identities outlive sessions. A name is a mailbox, not a process.
 
