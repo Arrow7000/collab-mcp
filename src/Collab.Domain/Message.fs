@@ -49,9 +49,38 @@ module Envelope =
 
     /// The only way to make an Envelope: the router stamps `From` from the binding it
     /// resolved, never from anything the sender claimed.
-    let seal (from: AgentName) (now: DateTimeOffset) (request: SendRequest) : Envelope =
-        failwith "TODO"
+    ///
+    /// `conversation` is supplied by the router, which is the only party that can look
+    /// up the thread an `InReplyTo` belongs to. `None` starts a new one.
+    let seal
+        (from: AgentName)
+        (now: DateTimeOffset)
+        (conversation: ConversationId option)
+        (request: SendRequest)
+        : Envelope =
+        { Id = MessageId(Guid.NewGuid())
+          Conversation = conversation |> Option.defaultWith (fun () -> ConversationId(Guid.NewGuid()))
+          From = from
+          To = request.To
+          Body = request.Body
+          Urgency = request.Urgency
+          InReplyTo = request.InReplyTo
+          SentAt = now }
+
+    /// ASCII unit separator delimits the fields. `AgentName` forbids control
+    /// characters, so no two distinct triples can collide on one key.
+    [<Literal>]
+    let private Sep = "\u001F"
 
     /// Content identity used for duplicate suppression: same sender, recipient and
     /// body within a window is a repeat, regardless of MessageId (DESIGN.md §8).
-    let contentKey (envelope: Envelope) : string = failwith "TODO"
+    ///
+    /// Urgency is deliberately excluded, so that re-sending the same text as an
+    /// interrupt does not slip past the check.
+    let contentKey (envelope: Envelope) : string =
+        String.Join(Sep, [ AgentName.key envelope.From; AgentName.key envelope.To; envelope.Body ])
+
+    /// The pair a message travels on, for rate limiting. Directional: A flooding B
+    /// says nothing about B's budget to answer.
+    let pairKey (from: AgentName) (recipient: AgentName) : string =
+        AgentName.key from + Sep + AgentName.key recipient

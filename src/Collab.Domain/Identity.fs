@@ -52,16 +52,44 @@ module AgentName =
     [<Literal>]
     let MaxLength = 64
 
+    /// Letters, digits, hyphen and underscore. Deliberately narrow: names travel
+    /// through JSON, map keys and log lines, and a name that needs quoting anywhere
+    /// is a name that will eventually be mangled somewhere.
+    let private isLegal (c: char) = Char.IsLetterOrDigit c || c = '-' || c = '_'
+
     /// Total constructor. Rejects rather than repairs.
-    let create (raw: string) : Result<AgentName, NameError> = failwith "TODO"
+    let create (raw: string) : Result<AgentName, NameError> =
+        let trimmed = if isNull raw then "" else raw.Trim()
+
+        if String.IsNullOrEmpty trimmed then
+            Error Empty
+        elif trimmed.Length > MaxLength then
+            Error(TooLong(trimmed.Length, MaxLength))
+        else
+            let offending =
+                trimmed |> Seq.filter (isLegal >> not) |> Seq.distinct |> Seq.toArray |> String
+
+            if offending.Length > 0 then
+                Error(IllegalCharacters offending)
+            else
+                Ok(AgentName trimmed)
 
     let value (AgentName n) : string = n
 
-    /// Case-insensitive, so `redstone` and `RedStone` cannot both be claimed.
-    let equivalent (a: AgentName) (b: AgentName) : bool = failwith "TODO"
+    /// Canonical form used for map keys and comparisons, so `redstone` and `RedStone`
+    /// cannot both be claimed. The original casing is what we display.
+    let key (name: AgentName) : string = (value name).ToLowerInvariant()
+
+    let equivalent (a: AgentName) (b: AgentName) : bool = key a = key b
 
 module Binding =
 
-    let endpoint (binding: Binding) : Endpoint option = failwith "TODO"
+    let endpoint (binding: Binding) : Endpoint option =
+        match binding with
+        | Unbound -> None
+        | Bound(endpoint = e) -> Some e
 
-    let isLive (binding: Binding) : bool = failwith "TODO"
+    let isLive (binding: Binding) : bool =
+        match binding with
+        | Unbound -> false
+        | Bound _ -> true

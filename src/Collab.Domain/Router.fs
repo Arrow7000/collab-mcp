@@ -19,21 +19,39 @@ type Registration =
 
 /// Mail held for a name with no live session. Ordered, so a session that binds
 /// receives a backlog in the order it was sent.
-type Parked = { Envelope: Envelope; ParkedAt: DateTimeOffset }
+///
+/// `ExpiresAt` bounds the hold: peers spawned together race, so parking is how a
+/// sender that is ready first avoids retrying, but a name nobody claims must not
+/// swallow mail indefinitely.
+type ParkedMail =
+    { Envelope: Envelope
+      ParkedAt: DateTimeOffset
+      ExpiresAt: DateTimeOffset }
+
+/// One past send on a sender→recipient pair. Carries the content key so duplicate
+/// suppression does not need the original envelope.
+type RecentSend =
+    { At: DateTimeOffset
+      Id: MessageId
+      Content: string }
 
 /// The router's whole state. A value, so it can be rebuilt by replaying the log.
 type RouterState =
     { Registrations: Map<string, Registration>
-      Parked: Parked list
+      Parked: ParkedMail list
       /// Recent traffic per sender→recipient pair, for rate limiting and duplicate
       /// suppression. Trimmed against the clock rather than growing without bound.
-      Recent: Map<string, (DateTimeOffset * MessageId) list>
-      /// Interruptions spent per sender in the current window.
-      InterruptsSpent: Map<string, int> }
+      Recent: Map<string, RecentSend list>
+      /// When each sender spent an interruption, so the budget window can slide
+      /// rather than reset on a fixed schedule.
+      Interrupts: Map<string, DateTimeOffset list> }
 
 /// The limits from DESIGN.md §8, in one place so they can be tuned as data.
 type Limits =
-    { MaxPerPairPerWindow: int
+    { /// How long undeliverable mail is held before being returned to its sender.
+      /// Sized for a peer that is still booting, not for one that never arrives.
+      ParkWindow: TimeSpan
+      MaxPerPairPerWindow: int
       PairWindow: TimeSpan
       DuplicateWindow: TimeSpan
       InterruptsPerWindow: int
@@ -45,8 +63,12 @@ type Limits =
 type Intent =
     /// Push now to a live endpoint.
     | PushTo of endpoint: Endpoint * envelope: Envelope
-    /// Hold: the recipient exists but has no live session.
-    | Park of envelope: Envelope
+    /// Hold: nothing is bound to the recipient's name yet.
+    | Park of envelope: Envelope * until: DateTimeOffset
+    /// The hold expired without anyone claiming the name. Wake the *sender* and tell
+    /// it, so an unroutable message surfaces through the same push path as any other
+    /// message rather than vanishing.
+    | ReturnToSender of envelope: Envelope * reason: string
     /// Tell the sender no, with a reason it can act on.
     | Decline of Refusal
     /// Bind a name to the session that just proved it owns it.
@@ -68,9 +90,14 @@ module RouterState =
 
     let lookup (name: AgentName) (state: RouterState) : Registration option = failwith "TODO"
 
-    /// Drop expired entries from `Recent` and `InterruptsSpent`. Called on each
-    /// decision so the maps stay bounded without a background sweeper.
-    let evict (now: DateTimeOffset) (limits: Limits) (state: RouterState) : RouterState =
+    /// Drop expired entries from `Recent` and `Interrupts`, and expire overdue parked
+    /// mail. Called on each decision so the maps stay bounded without a background
+    /// sweeper; the returned intents carry anything that has to be handed back.
+    let evict
+        (now: DateTimeOffset)
+        (limits: Limits)
+        (state: RouterState)
+        : RouterState * Intent list =
         failwith "TODO"
 
 module Router =

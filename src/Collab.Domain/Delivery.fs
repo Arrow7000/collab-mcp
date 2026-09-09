@@ -11,9 +11,6 @@ open System
 /// Refusals the router decides, before any harness is involved. Each is a rule from
 /// DESIGN.md §8, made explicit so the sender is told *why* rather than just "failed".
 type Refusal =
-    /// No such name has ever been registered. Distinct from a name that is merely
-    /// unbound, which parks instead of refusing.
-    | UnknownRecipient of AgentName
     /// Addressing yourself. Almost always a model error; refusing surfaces it.
     | SelfAddressed of AgentName
     /// Too many messages on this sender→recipient pair in the window.
@@ -22,6 +19,8 @@ type Refusal =
     | DuplicateSuppressed of original: MessageId
     /// The sender has spent its allowance of interruptions.
     | InterruptBudgetExhausted of resetsAt: DateTimeOffset
+    /// The recipient already has more parked mail than we will hold for it.
+    | RecipientBacklogFull of recipient: AgentName * max: int
     /// The sender's own session could not perform what it is asking for, so carrying
     /// the request would launder a capability it does not hold.
     | WouldLaunderPermission of detail: string
@@ -42,21 +41,35 @@ type DeliveryOutcome =
     /// delivering to it wakes it. Waking idle agents is the point of the system, not
     /// an edge case.
     | Delivered of at: DateTimeOffset
-    /// The recipient's name is registered but nothing is bound to it: the agent has
-    /// not started yet, or its session has ended. Held until a session claims the
-    /// name, then flushed in order.
+    /// Nothing is bound to the recipient's name: it has not started yet, its session
+    /// has ended, or the name is simply wrong. Held until a session claims the name,
+    /// then flushed in order.
     ///
-    /// Note this is strictly about the *absence of a binding*. An idle session is not
-    /// parked; it is `Delivered` to.
-    | Parked of since: DateTimeOffset
+    /// Parking is bounded. It exists because peers spawned together race — a sender is
+    /// routinely ready before its partner has registered — and refusing there would
+    /// force exactly the retry loops this design abolishes. But a name nobody ever
+    /// claims must not swallow mail, so the hold has a deadline, after which the
+    /// envelope is returned to its sender (`Intent.ReturnToSender`).
+    ///
+    /// Strictly about the *absence of a binding*. An idle session is not parked; it is
+    /// `Delivered` to.
+    | Parked of since: DateTimeOffset * expiresAt: DateTimeOffset
     | Refused of Refusal
     | Failed of DeliveryFault
 
 module DeliveryOutcome =
 
-    /// Whether the sender should consider the message its responsibility still.
-    /// `Parked` is *not* a failure — the design promises delivery on bind.
-    let isTerminal (outcome: DeliveryOutcome) : bool = failwith "TODO"
+    /// Whether the sender still has to do something about this message.
+    ///
+    /// `Parked` is false: the router has taken ownership and will either deliver it or
+    /// hand it back. Telling a model it must act on a parked message is what produces
+    /// retry loops.
+    let senderMustAct (outcome: DeliveryOutcome) : bool =
+        match outcome with
+        | Delivered _ -> false
+        | Parked _ -> false
+        | Refused _ -> true
+        | Failed _ -> true
 
     /// Human-facing sentence returned to the calling agent, so a model gets an
     /// actionable reason rather than an error code.
