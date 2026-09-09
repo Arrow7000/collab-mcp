@@ -11,10 +11,6 @@ open System
 /// Refusals the router decides, before any harness is involved. Each is a rule from
 /// DESIGN.md §8, made explicit so the sender is told *why* rather than just "failed".
 type Refusal =
-    /// No agent by that name has ever been enlisted. Immediate and certain, because
-    /// the router is the allocator: a name it has not minted cannot be one that is
-    /// merely slow to start. Almost always a misaddressed message.
-    | UnknownRecipient of AgentName
     /// Addressing yourself. Almost always a model error; refusing surfaces it.
     | SelfAddressed of AgentName
     /// Too many messages on this sender→recipient pair in the window.
@@ -45,13 +41,13 @@ type DeliveryOutcome =
     /// delivering to it wakes it. Waking idle agents is the point of the system, not
     /// an edge case.
     | Delivered of at: DateTimeOffset
-    /// The recipient has been enlisted but nothing is bound to its name: it has not
-    /// claimed the name yet, or its session has ended. Held until a session claims it,
-    /// then flushed in order.
+    /// Nothing is bound to the recipient's name in this scope: it has not announced
+    /// itself yet, its session has ended, or the name is simply wrong. Held until a
+    /// session claims it, then flushed in order.
     ///
-    /// This is only reachable for a name the router itself minted, so it always means
-    /// "a known agent is not ready", never "who?". It exists because peers spawned
-    /// together race — a sender is routinely ready before its partner has claimed its
+    /// Agents name themselves, so the router cannot tell "still booting" from
+    /// "misaddressed" at send time — and must therefore assume the former, because
+    /// peers spawned together race — a sender is routinely ready before its partner has claimed its
     /// name — and refusing there would force exactly the retry loops this design
     /// abolishes. The hold still has a deadline, for an agent that dies before ever
     /// claiming; on expiry the envelope goes back to its sender

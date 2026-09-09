@@ -72,9 +72,16 @@ module Mapping =
 
     /// A session id from the bus is an opencode endpoint by construction: this is the
     /// only harness this adapter speaks for.
-    let private endpointOf (session: string) : Endpoint =
-        { Harness = HarnessKind.OpenCode
-          Session = SessionId session }
+    ///
+    /// An event without a `location` cannot be scoped, and an unscoped endpoint would
+    /// silently join every project into one namespace. So the directory is required,
+    /// and a frame lacking it is dropped rather than guessed at.
+    let private endpointOf (frame: EventFrame) (session: string) : Endpoint option =
+        frame.Directory
+        |> Option.map (fun directory ->
+            { Harness = HarnessKind.OpenCode
+              Session = SessionId session
+              Scope = Scope directory })
 
     /// Decode one frame. Total: anything we do not act on, or cannot read, is `None`.
     let observe (frame: EventFrame) : Observation option =
@@ -88,9 +95,13 @@ module Mapping =
         | EventTypes.ToolCalled ->
             match field "sessionID", field "id", Json.field "input" frame.Data with
             | Some session, Some callId, Some input ->
-                Some(ToolCalled(endpointOf session, callId, input.ToJsonString()))
+                endpointOf frame session
+                |> Option.map (fun endpoint -> ToolCalled(endpoint, callId, input.ToJsonString()))
             | _ -> None
-        | EventTypes.SessionDeleted -> field "sessionID" |> Option.map (endpointOf >> SessionDeleted)
+        | EventTypes.SessionDeleted ->
+            field "sessionID"
+            |> Option.bind (endpointOf frame)
+            |> Option.map SessionDeleted
         | _ -> None
 
 module Faults =

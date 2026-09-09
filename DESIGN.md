@@ -152,31 +152,37 @@ would duplicate the runtime and get it subtly wrong, so `HarnessEvent` carries n
 
 ## 7. Identity and attribution
 
-**The router allocates names.** An identity is *minted* before the agent that will use
-it exists — by a lead about to spawn subagents, or by a human at the CLI setting up a
-run of top-level peers. Minting returns the name and a `ClaimToken`, which is passed to
-the agent and proves entitlement when it claims the name.
+**Agents name themselves.** An agent announces its name with `hello`; there is no
+allocation step and nothing to create before a run. An earlier design had the router
+mint names so that an unknown recipient could be rejected outright rather than parked,
+but that bought only immediate typo feedback — which `ReturnToSender` already gives —
+and protection against name-squatting, which is not a threat model for agents that are
+all the same user's, on one machine. It was complexity without a payer.
 
-This ordering is what makes addressing honest. A name the router never minted cannot be
-a peer that is merely slow to start, so it is rejected immediately as misaddressed. A
-name it did mint, but which nothing is bound to yet, is a known agent that is not ready
-— so mail parks. Without the router as allocator those two cases are indistinguishable,
-and every unknown name has to be given the benefit of the doubt.
+The cost is that the router cannot distinguish "still booting" from "misaddressed" at
+send time, so it must assume the former and park under a deadline. Peers spawned
+together genuinely do race, and refusing there is what forces retry loops.
 
 Names are **never rewritten**. An invalid or colliding name is an error, not a silent
 substitution.
 
-Because identities must exist before use, enlisting needs a CLI path as well as an MCP
-verb: a lead can mint names for the subagents it spawns, but two top-level peers have no
-lead to do it for them.
+**Scope is derived, never configured.** A name is unique within a project, not across
+the machine, so two unrelated repositories cannot collide on `RedStone`. The project
+comes from the harness: opencode puts `location.directory` on every event, and Claude
+Code exports `CLAUDE_PROJECT_DIR` to the servers it spawns. There is no workspace to
+create, name or enumerate — agents working the same directory are peers, and an event
+that arrives without a location is dropped rather than guessed at, since an unscoped
+endpoint would silently merge every project into one namespace.
 
 Binding `name → endpoint`:
 
 - **Claude Code**: read `CLAUDE_CODE_SESSION_ID` from the shim's environment. Direct.
-- **opencode**: the agent claims its name with its token; the router then matches the
-  `session.tool.called` event from that claim and binds the emitting `sessionID`. The
-  token establishes *who*, the event establishes *where*. One correlation at bind time;
-  the mapping is durable and re-bindable when a session restarts.
+- **opencode**: the agent announces its name; the router matches the
+  `session.tool.called` event carrying that call and binds the emitting `sessionID`.
+  Note the tool *name* is not on that event — it arrives on the earlier
+  `session.tool.input.started` and is joined on the call id — so the adapter needs both
+  frames to reconstruct one invocation. One correlation at bind time; the mapping is
+  durable and re-bindable when a session restarts.
 
 Identities outlive sessions. A name is a mailbox, not a process.
 

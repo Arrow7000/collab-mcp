@@ -65,7 +65,15 @@ type AdmittedId = AdmittedId of string
 ///
 /// The surrounding envelope (`id`, `created`, `durable`, `location`) is dropped here
 /// so that the adapter's mapping reads as field lookups rather than as navigation.
-type EventFrame = { Type: string; Data: JsonNode }
+/// One decoded event.
+///
+/// `Directory` comes from the event's top-level `location`, which the daemon puts on
+/// every event. It is what scopes an agent to a project, so it is lifted here rather
+/// than left buried in the raw node.
+type EventFrame =
+    { Type: string
+      Data: JsonNode
+      Directory: string option }
 
 module Delivery =
 
@@ -238,10 +246,17 @@ module Wire =
                 let data =
                     Json.field "data" root |> Option.defaultValue (JsonObject() :> JsonNode)
 
+                let directory =
+                    Json.field "location" root
+                    |> Option.bind (Json.stringField "directory")
+
                 if String.IsNullOrEmpty kind then
                     None
                 else
-                    Some { Type = kind; Data = data }
+                    Some
+                        { Type = kind
+                          Data = data
+                          Directory = directory }
         with _ ->
             None
 

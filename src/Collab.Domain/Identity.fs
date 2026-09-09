@@ -30,24 +30,27 @@ type HarnessKind =
 /// only the owning adapter understands its shape.
 type SessionId = SessionId of string
 
-/// Secret minted with a name and handed to whoever will run that agent. Presenting it
-/// is what proves entitlement to the name.
+/// The project two agents must share in order to reach each other.
 ///
-/// This is why an agent cannot squat a peer's identity, and why binding does not have
-/// to resort to comparing serialised tool arguments: the token is unguessable, so a
-/// claim either matches exactly or is rejected.
-type ClaimToken = ClaimToken of string
+/// Derived, never configured: opencode puts `location.directory` on every event, and
+/// Claude Code exports `CLAUDE_PROJECT_DIR` to the servers it spawns. So there is no
+/// workspace to create, name or enumerate — agents working the same directory are
+/// peers, and agents in unrelated projects cannot collide on a name.
+type Scope = Scope of directory: string
 
-/// A live destination: a session, in a harness, that we can deliver to.
-type Endpoint = { Harness: HarnessKind; Session: SessionId }
+/// A live destination: a session, in a harness, working in a project.
+type Endpoint =
+    { Harness: HarnessKind
+      Session: SessionId
+      Scope: Scope }
 
 /// Where a name currently points.
 ///
-/// Names are *minted* by the router before any session exists, so `Unbound` means
-/// something precise: this agent has been enlisted but has not claimed its name yet,
-/// or has claimed it and since gone. It never means "no idea who that is" — an
-/// unminted name is rejected outright, which is only sound because the router is the
-/// allocator (DESIGN.md §7).
+/// Agents choose their own names and announce them with `hello`, so `Unbound` covers
+/// both "known agent, not ready yet" and "nobody has ever used that name". The router
+/// cannot tell those apart at send time, which is exactly why an unbound recipient
+/// parks under a deadline rather than being refused: the common case is a peer that is
+/// still booting, and the deadline is what stops a misaddressed message vanishing.
 ///
 /// A name binds to at most one endpoint. Where an agent "lives" is the harness's
 /// concern, and session ids do not collide across directories, so a second concurrent
@@ -94,6 +97,13 @@ module AgentName =
     let key (name: AgentName) : string = (value name).ToLowerInvariant()
 
     let equivalent (a: AgentName) (b: AgentName) : bool = key a = key b
+
+module Scope =
+
+    /// Canonical form for comparison. Trailing separators and case differences must not
+    /// split one project into two namespaces.
+    let key (Scope directory) : string =
+        directory.TrimEnd('/').ToLowerInvariant()
 
 module Binding =
 

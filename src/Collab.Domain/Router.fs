@@ -8,21 +8,18 @@ namespace Collab.Domain
 
 open System
 
-/// What the router knows about one identity, from the moment it is minted.
+/// What the router knows about one identity.
 ///
-/// A Registration exists before any agent does: enlisting creates it, claiming binds
-/// it. That ordering is what lets an unminted name be rejected outright while a minted
-/// one parks.
+/// Scoped: a name is unique within a project, not across the machine, so unrelated
+/// repositories cannot collide on `RedStone`.
 type Registration =
     { Name: AgentName
-      /// Proves entitlement to this name. Never leaves the router except to whoever
-      /// enlisted the agent, who passes it to the agent itself.
-      Token: ClaimToken
+      Scope: Scope
       Binding: Binding
-      /// Set when an agent has presented a valid token but we have not yet seen which
-      /// session it spoke from. Resolved by the next `AgentInvoked` event.
-      PendingClaim: ClaimToken option
-      EnlistedAt: DateTimeOffset }
+      /// Set when an agent has announced a name but we have not yet seen which session
+      /// it spoke from. Resolved by the next matching `AgentInvoked` event.
+      PendingClaim: ToolInvocation option
+      FirstSeen: DateTimeOffset }
 
 /// Mail held for a name with no live session. Ordered, so a session that binds
 /// receives a backlog in the order it was sent.
@@ -78,8 +75,6 @@ type Intent =
     | ReturnToSender of envelope: Envelope * reason: string
     /// Tell the sender no, with a reason it can act on.
     | Decline of Refusal
-    /// Hand a freshly minted identity back to whoever enlisted it.
-    | Enlisted of name: AgentName * token: ClaimToken
     /// Bind a name to the session that just proved it owns it.
     | CompleteClaim of name: AgentName * endpoint: Endpoint
     /// Release a binding whose session has gone, re-parking anything undelivered.
@@ -97,7 +92,12 @@ module RouterState =
 
     let empty: RouterState = failwith "TODO"
 
-    let lookup (name: AgentName) (state: RouterState) : Registration option = failwith "TODO"
+    /// Registrations are keyed by scope and name together; a lookup without a scope
+    /// is meaningless.
+    let key (scope: Scope) (name: AgentName) : string = failwith "TODO"
+
+    let lookup (scope: Scope) (name: AgentName) (state: RouterState) : Registration option =
+        failwith "TODO"
 
     /// Drop expired entries from `Recent` and `Interrupts`, and expire overdue parked
     /// mail. Called on each decision so the maps stay bounded without a background
@@ -111,27 +111,16 @@ module RouterState =
 
 module Router =
 
-    /// Mint an identity. Called before the agent exists — by a lead about to spawn
-    /// subagents, or by a human at the CLI setting up a run of top-level peers. The
-    /// name becomes addressable immediately, so a peer that starts first can send to
-    /// it and have the message park rather than bounce.
-    let enlist
-        (now: DateTimeOffset)
-        (name: AgentName)
-        (token: ClaimToken)
-        (state: RouterState)
-        : Result<RouterState * Intent list, Refusal> =
-        failwith "TODO"
-
-    /// An agent presents its token to take up its identity. The claim is not bound
-    /// until an `AgentInvoked` event says which session it came from: the token
-    /// establishes *who*, the event establishes *where* (DESIGN.md §7).
+    /// An agent announces the name it is speaking as. The claim is not bound until an
+    /// `AgentInvoked` event says which session it came from, because MCP itself cannot
+    /// tell us (DESIGN.md §7). Until then the name is reserved but undeliverable.
     let claim
         (now: DateTimeOffset)
+        (scope: Scope)
         (name: AgentName)
-        (token: ClaimToken)
+        (invocation: ToolInvocation)
         (state: RouterState)
-        : Result<RouterState * Intent list, Refusal> =
+        : RouterState * Intent list =
         failwith "TODO"
 
     /// The main decision. Total in the outcome: every rejection path is a `Refusal`
@@ -139,6 +128,7 @@ module Router =
     let send
         (now: DateTimeOffset)
         (limits: Limits)
+        (scope: Scope)
         (from: AgentName)
         (request: SendRequest)
         (state: RouterState)
