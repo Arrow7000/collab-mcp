@@ -38,7 +38,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
   if args.mode=='identity' and body['messages'][-1]['role']=='user':
    code=None
    if 'identity rename' in lastUser:code='return await tools.collab.hello({name:"Crimson"})'
-   if 'identity send' in lastUser:code='return await Promise.all([tools.collab.send({to:"Red",body:"alias payload"}),tools.collab.send({to:'+json.dumps(identityAddress)+',body:"ID payload"})])'
+   if 'identity reply' in lastUser:code='return await tools.collab.send({to:'+json.dumps(identitySenderAddress)+',body:"reply payload"})'
+   if 'identity send' in lastUser:code='return await Promise.all([tools.collab.roster({}),tools.collab.send({to:"Red",body:"alias payload"}),tools.collab.send({to:'+json.dumps(identityAddress)+',body:"ID payload"})])'
    if code:
     msg={'role':'assistant','content':None,'tool_calls':[{'id':'probe_'+str(len(requests)),'type':'function','function':{'name':'execute','arguments':json.dumps({'code':code})}}]};finish='tool_calls'
   if body.get('stream'):
@@ -150,6 +151,7 @@ try:
    with sqlite3.connect('file:'+env['COLLAB_MCP_HOME']+'/state.sqlite?mode=ro',uri=True) as db:
     return json.loads(db.execute('SELECT payload FROM state WHERE id=1').fetchone()[0])
   initial=stateSnapshot()['registrations'][0];identityTarget=initial['peerId'];identityAddress=initial['shortId']
+  assert re.fullmatch('[0-9a-f]{8}',identityAddress),identityAddress
   api('POST',f'/api/session/{session}/prompt',{'text':'identity rename'})
   for _ in range(100):
    renamed=next((r for r in stateSnapshot()['registrations'] if r['peerId']==identityTarget),None)
@@ -161,7 +163,10 @@ try:
    peers=stateSnapshot()['registrations']
    if len(peers)==2:break
    time.sleep(.1)
-  sender=next(r for r in peers if r['peerId']!=identityTarget)
+  sender=next(r for r in peers if r['peerId']!=identityTarget);identitySenderAddress=sender['shortId']
+  assert re.fullmatch('[0-9a-f]{8}',identitySenderAddress) and identitySenderAddress!=identityAddress
+  assert re.fullmatch('oc2-[a-z]+-[a-z]+(?:-[0-9]+)?',sender['name']),sender['name']
+  assert renamed['shortId']==identityAddress,'rename changed short ID'
   api('POST',f'/api/session/{second}/prompt',{'text':'identity send'})
   for _ in range(150):
    messages=json.dumps(api('GET',f'/api/session/{session}/message?limit=100'))
@@ -170,7 +175,20 @@ try:
   assert 'alias payload' in messages and 'ID payload' in messages,'messages did not reach renamed peer'
   assert sender['shortId'] in messages,'sender ID missing in received message'
   assert renamed['peerId']==initial['peerId'],'rename changed identity'
-  print('Rename retained peer ID; old-name and ID sends reached the same peer with sender ID: passed.')
+  for _ in range(100):
+   rosterMessages=json.dumps(api('GET',f'/api/session/{second}/message?limit=100'))
+   if all(value in rosterMessages for value in ['Crimson',identityAddress,identitySenderAddress,'Red']):break
+   time.sleep(.1)
+  assert all(value in rosterMessages for value in ['Crimson',identityAddress,identitySenderAddress,'Red']),'roster omitted identities or alias'
+  api('POST',f'/api/session/{session}/prompt',{'text':'identity reply'})
+  for _ in range(150):
+   replyMessages=json.dumps(api('GET',f'/api/session/{second}/message?limit=100'),ensure_ascii=False)
+   if 'reply payload' in replyMessages:break
+   time.sleep(.1)
+  assert 'reply payload' in replyMessages and identityAddress in replyMessages,'reply by bare sender ID failed'
+  assert '[peer Crimson · '+identityAddress+']' in replyMessages,'reply did not show renamed sender and bare ID'
+  print('Two OC2 agents: distinct bare hex IDs, readable default name, roster IDs/alias, rename continuity: passed.')
+  print('Old-name and bare-ID sends, plus reply by sender ID in the opposite direction: passed.')
  if os.environ.get('PROBE_TUI')=='1':
   time.sleep(.5)
   master,slave=pty.openpty();fcntl.ioctl(slave,termios.TIOCSWINSZ,struct.pack('HHHH',35,120,0,0))

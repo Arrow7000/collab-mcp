@@ -408,6 +408,12 @@ delivery contract; unsupported urgency must be explicit.
 
 ### Evidence
 
+- 2026-09-14: latest Release build checked with two real OC2 2.0.3 sessions using
+  an isolated local scripted provider. Verified automatic registration before hello,
+  distinct bare IDs, readable generated names, roster IDs/aliases, rename continuity,
+  old-name and bare-ID delivery, and a reply by sender ID in the opposite direction.
+  These are harness integration checks, not an autonomous-model collaboration test.
+
 - 2026-09-14: removed the public ID prefix; bare hex and prior prefixed addresses
   resolve to the same identity. Version-3 migration preserves submitted text. All
   105 tests and the real OC2 identity check pass; the live migration preserved
