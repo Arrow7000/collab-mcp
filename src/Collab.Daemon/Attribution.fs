@@ -1,19 +1,5 @@
-/// Working out which session made a call that carries no sender.
-///
-/// MCP tells a server nothing about its caller: `clientInfo` names the CLI, there are no
-/// session environment variables, and the stdio process is a child of the shared harness
-/// daemon serving every session at once (DESIGN.md §4, F5). So the agent could not tell
-/// us which session it is even if we trusted it to — and we would not, because an
-/// identity supplied by the caller is an identity the caller can choose.
-///
-/// The harness supplies it instead. It announces the same call on its event bus, with
-/// the session attached, and this table joins the two halves. The agent is never asked
-/// and cannot lie; it also cannot get it wrong, which removes more mistakes than it
-/// prevents lies.
-///
-/// Both arrival orders happen — the harness's announcement and the call itself race by a
-/// millisecond or so — so a fact that arrives first waits for its call, and a call that
-/// arrives first waits for its fact.
+/// Join required harness-supplied session metadata to observed project context.
+/// Both arrival orders are supported; facts from another session never match.
 namespace Collab.Daemon
 
 open System
@@ -77,12 +63,13 @@ type private Fact =
 
 type private Waiter =
     { Key: string
+      Session: SessionId
       Completion: TaskCompletionSource<Endpoint> }
 
 /// The join, in both directions.
 ///
-/// `capacity` and `ttl` bound the facts held: every tool call in every session is
-/// announced here, not just ours, and only a handful are ever claimed. An overrun costs
+/// `capacity` and `ttl` bound the facts held: our tool calls across observed sessions
+/// are announced here. An overrun costs
 /// an unmatched call, which times out and tells the agent so.
 type Attribution(capacity: int, ttl: TimeSpan, clock: Clock) =
 
@@ -90,15 +77,7 @@ type Attribution(capacity: int, ttl: TimeSpan, clock: Clock) =
     let facts = List<Fact>()
     let waiting = List<Waiter>()
 
-    /// The tool name and its arguments together.
-    ///
-    /// Deliberately not the session or anything else the caller could influence: those
-    /// are what we are trying to *learn*. Two calls with the same name and the same
-    /// arguments are genuinely indistinguishable — an argument-free verb such as
-    /// `roster` is the honest case — so matching is oldest-first, and simultaneous
-    /// identical calls from different projects can in principle be swapped. Nothing on
-    /// either side of the join distinguishes them; the alternative would be asking the
-    /// agent for something, which is the thing this exists to avoid.
+    /// Session is checked separately; canonical arguments join the two transports.
     let keyOf (invocation: ToolInvocation) : string =
         invocation.Tool + string (char 0x1F) + Canonical.ofJson invocation.Input
 
@@ -109,8 +88,11 @@ type Attribution(capacity: int, ttl: TimeSpan, clock: Clock) =
             facts.RemoveAt 0
 
     /// Take the oldest fact matching this key, if one is already here.
-    let takeFact (key: string) =
-        match facts.FindIndex(fun f -> f.Key = key) with
+    let sessionMatches session (endpoint: Endpoint) =
+        session = endpoint.Session
+
+    let takeFact (key: string) (session: SessionId) =
+        match facts.FindIndex(fun f -> f.Key = key && sessionMatches session f.Endpoint) with
         | -1 -> None
         | index ->
             let found = facts[index]
@@ -124,7 +106,7 @@ type Attribution(capacity: int, ttl: TimeSpan, clock: Clock) =
 
         let waiter =
             lock gate (fun () ->
-                match waiting.FindIndex(fun w -> w.Key = key) with
+                match waiting.FindIndex(fun w -> w.Key = key && sessionMatches w.Session endpoint) with
                 | -1 ->
                     prune now
                     facts.Add { Key = key; Endpoint = endpoint; At = now }
@@ -145,7 +127,7 @@ type Attribution(capacity: int, ttl: TimeSpan, clock: Clock) =
 
     /// Which session made this call. `None` if the harness never said — the agent is
     /// running somewhere we do not observe, or the fact was lost.
-    member _.Resolve(invocation: ToolInvocation, timeout: TimeSpan) : Async<Endpoint option> =
+    member _.Resolve(invocation: ToolInvocation, timeout: TimeSpan, session: SessionId) : Async<Endpoint option> =
         async {
             let key = keyOf invocation
 
@@ -155,11 +137,12 @@ type Attribution(capacity: int, ttl: TimeSpan, clock: Clock) =
                 lock gate (fun () ->
                     prune (clock.Now())
 
-                    match takeFact key with
+                    match takeFact key session with
                     | Some endpoint -> Choice1Of2 endpoint
                     | None ->
                         let waiter =
                             { Key = key
+                              Session = session
                               Completion =
                                 TaskCompletionSource<Endpoint> TaskCreationOptions.RunContinuationsAsynchronously }
 

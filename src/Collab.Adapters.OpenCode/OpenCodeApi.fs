@@ -18,6 +18,7 @@ open System.Text
 open System.Text.Json
 open System.Text.Json.Nodes
 open System.Threading
+open System.Threading.Tasks
 
 /// When the daemon should act on an admitted message.
 ///
@@ -39,6 +40,7 @@ type ApiError =
     | Unreachable of detail: string
     | SessionNotFound of session: string
     | Rejected of status: int * detail: string
+    | AdmissionUnknown of detail: string
 
 /// Where the daemon is listening, and the credential it demands.
 ///
@@ -48,7 +50,8 @@ type ServiceEndpoint = { BaseUrl: Uri; Password: string }
 
 /// The body of a synthetic admission: input that is not a user turn.
 type SyntheticMessage =
-    { Text: string
+    { Id: string option
+      Text: string
       /// Shown by opencode beside the message. We put the sender there as well as in
       /// the text, so provenance survives anywhere the body is elided.
       Description: string option
@@ -143,11 +146,11 @@ module Discovery =
     /// The port is dynamic and otherwise recorded only in opencode's own log, so
     /// shelling out is not laziness — it is the only contract offered (DESIGN.md §9).
     /// It is also the reason the result is cached by the client: this forks a process.
-    let baseUrl () : Result<Uri, ApiError> =
+    let baseUrlFor (executable: string) (timeout: TimeSpan) : Result<Uri, ApiError> =
         try
             let start =
                 ProcessStartInfo(
-                    FileName = Executable,
+                    FileName = executable,
                     RedirectStandardOutput = true,
                     RedirectStandardError = true,
                     UseShellExecute = false
@@ -157,19 +160,27 @@ module Discovery =
             start.ArgumentList.Add "status"
 
             use runner = Process.Start start
-            let out = runner.StandardOutput.ReadToEnd()
-            let err = runner.StandardError.ReadToEnd()
-
-            if not (runner.WaitForExit StatusTimeoutMs) then
-                Error(Unreachable $"`{Executable} service status` did not exit within {StatusTimeoutMs}ms")
-            elif runner.ExitCode <> 0 then
-                Error(Unreachable $"`{Executable} service status` exited {runner.ExitCode}: {err.Trim()}")
-            else
-                match firstUrl out with
-                | Some uri -> Ok uri
-                | None -> Error(Unreachable $"`{Executable} service status` printed no URL: {out.Trim()}")
+            use deadline = new CancellationTokenSource(timeout)
+            let stdout = runner.StandardOutput.ReadToEndAsync(deadline.Token)
+            let stderr = runner.StandardError.ReadToEndAsync(deadline.Token)
+            try
+                let exiting = runner.WaitForExitAsync(deadline.Token)
+                Task.WhenAll([| stdout :> Task; stderr :> Task; exiting |]).GetAwaiter().GetResult()
+                let out, err = stdout.Result, stderr.Result
+                if runner.ExitCode <> 0 then
+                    Error(Unreachable $"`{executable} service status` exited {runner.ExitCode}: {err.Trim()}")
+                else
+                    match firstUrl out with
+                    | Some uri -> Ok uri
+                    | None -> Error(Unreachable $"`{executable} service status` printed no URL: {out.Trim()}")
+            with :? OperationCanceledException ->
+                try runner.Kill(true) with _ -> ()
+                runner.WaitForExit 1000 |> ignore
+                Error(Unreachable $"`{executable} service status` exceeded its {timeout.TotalMilliseconds}ms deadline")
         with error ->
-            Error(Unreachable $"cannot run `{Executable} service status`: {error.Message}")
+            Error(Unreachable $"cannot run `{executable} service status`: {error.Message}")
+
+    let baseUrl () = baseUrlFor Executable (TimeSpan.FromMilliseconds(float StatusTimeoutMs))
 
     let password () : Result<string, ApiError> =
         let path = servicePasswordFile ()
@@ -200,6 +211,9 @@ module Routes =
     let synthetic (session: string) : string =
         $"/api/session/{Uri.EscapeDataString session}/synthetic"
 
+    let inbox (session: string) = $"/api/session/{Uri.EscapeDataString session}/inbox"
+    let message (session: string) (id: string) = $"/api/session/{Uri.EscapeDataString session}/message/{Uri.EscapeDataString id}"
+
     /// The daemon-wide event stream. Not per session: one subscription sees every
     /// session, which is what makes attribution by correlation possible at all.
     [<Literal>]
@@ -222,6 +236,7 @@ module Wire =
     /// The admission body. `delivery` is the whole reason the adapter boundary exists.
     let syntheticBody (message: SyntheticMessage) : string =
         let body = JsonObject()
+        message.Id |> Option.iter (fun id -> body["id"] <- JsonValue.Create id)
         body["text"] <- JsonValue.Create message.Text :> JsonNode
 
         match message.Description with
@@ -345,6 +360,7 @@ type OpenCodeClient private (locate: unit -> Result<ServiceEndpoint, ApiError>, 
 
     /// Point at a known daemon, for tests and for callers that already did discovery.
     new(service: ServiceEndpoint) = new OpenCodeClient((fun () -> Ok service), TimeSpan.FromSeconds 30.0)
+    new(service: ServiceEndpoint, requestTimeout: TimeSpan) = new OpenCodeClient((fun () -> Ok service), requestTimeout)
 
     /// Admit a message that is not a user turn, waking the session if it is idle.
     ///
@@ -368,20 +384,105 @@ type OpenCodeClient private (locate: unit -> Result<ServiceEndpoint, ApiError>, 
 
                     request.Headers.Authorization <- authorisation service
                     use deadline = new CancellationTokenSource(requestTimeout)
-                    use! response = http.SendAsync(request, deadline.Token) |> Async.AwaitTask
-                    let! body = response.Content.ReadAsStringAsync deadline.Token |> Async.AwaitTask
+                    use! response =
+                        http.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, deadline.Token)
+                        |> Async.AwaitTask
 
                     if response.IsSuccessStatusCode then
                         // An unparseable body does not undo a delivery that happened,
                         // so the handle is optional rather than the call a failure.
+                        let! body =
+                            async {
+                                try return! response.Content.ReadAsStringAsync deadline.Token |> Async.AwaitTask
+                                with _ -> return ""
+                            }
                         return Ok(Wire.unwrap body |> Option.bind (Json.stringField "id") |> Option.map AdmittedId)
                     elif int response.StatusCode = 404 then
                         return Error(SessionNotFound session)
                     else
-                        return Error(Rejected(int response.StatusCode, body.Trim()))
+                        let! body =
+                            async {
+                                try return! response.Content.ReadAsStringAsync deadline.Token |> Async.AwaitTask
+                                with _ -> return response.ReasonPhrase
+                            }
+                        let status = int response.StatusCode
+                        if status >= 500 || status = 408 then
+                            return Error(AdmissionUnknown $"HTTP {status}: {body.Trim()}")
+                        else return Error(Rejected(status, body.Trim()))
+                with error ->
+                    forget ()
+                    return Error(AdmissionUnknown error.Message)
+        }
+
+    /// Eligibility comes from the harness MCP registry for the observed project.
+    member _.HasServer(directory: string, server: string) : Async<Result<bool, ApiError>> = async {
+        match endpoint () with
+        | Error error -> return Error error
+        | Ok service ->
+            try
+                use deadline = new CancellationTokenSource(requestTimeout)
+                let route = "/api/mcp?location[directory]=" + Uri.EscapeDataString directory
+                use request = new HttpRequestMessage(HttpMethod.Get, Uri(service.BaseUrl, route))
+                request.Headers.Authorization <- authorisation service
+                use! response = http.SendAsync(request, deadline.Token) |> Async.AwaitTask
+                if not response.IsSuccessStatusCode then return Error(Rejected(int response.StatusCode, "MCP registry read failed"))
+                else
+                    let! body = response.Content.ReadAsStringAsync deadline.Token |> Async.AwaitTask
+                    match Wire.unwrap body with
+                    | Some(:? JsonArray as entries) ->
+                        return Ok(entries |> Seq.exists (fun entry ->
+                            Json.stringField "name" entry = Some server &&
+                            (Json.field "status" entry |> Option.bind (Json.stringField "status")) = Some "connected"))
+                    | _ -> return Error(Unreachable "malformed MCP registry response")
+            with error ->
+                forget ()
+                return Error(Unreachable error.Message)
+    }
+
+    /// Positive evidence only: absence cannot establish whether a prior admission ran.
+    member _.FindSynthetic(session: string, message: SyntheticMessage) : Async<Result<bool, ApiError>> =
+        let get (route: string) = async {
+            match endpoint () with
+            | Error error -> return Error error
+            | Ok service ->
+                try
+                    use deadline = new CancellationTokenSource(requestTimeout)
+                    use request = new HttpRequestMessage(HttpMethod.Get, Uri(service.BaseUrl, route))
+                    request.Headers.Authorization <- authorisation service
+                    use! response = http.SendAsync(request, deadline.Token) |> Async.AwaitTask
+                    if int response.StatusCode = 404 then return Ok None
+                    elif not response.IsSuccessStatusCode then
+                        return Error(Rejected(int response.StatusCode, "reconciliation read failed"))
+                    else
+                        let! body = response.Content.ReadAsStringAsync deadline.Token |> Async.AwaitTask
+                        match Wire.unwrap body with
+                        | Some data -> return Ok(Some data)
+                        | None -> return Error(Unreachable "malformed reconciliation response")
                 with error ->
                     forget ()
                     return Error(Unreachable error.Message)
+        }
+        let matches projected node =
+            let payload = if projected then Some node else Json.field "payload" node
+            Json.stringField "id" node = message.Id &&
+            Json.stringField "type" node = Some "synthetic" &&
+            (projected || (Json.stringField "sessionID" node = Some session &&
+                           Json.stringField "delivery" node = Some(Delivery.wire message.Delivery))) &&
+            (payload |> Option.exists (fun p ->
+                Json.stringField "text" p = Some message.Text &&
+                Json.stringField "description" p = message.Description))
+        async {
+            match message.Id with
+            | None -> return Error(Rejected(0, "reconciliation requires a stable message ID"))
+            | Some id ->
+                let! inbox = get (Routes.inbox session)
+                match inbox with
+                | Error error -> return Error error
+                | Ok(Some(:? JsonArray as items)) when items |> Seq.exists (matches false) -> return Ok true
+                | Ok(Some(:? JsonArray)) | Ok None ->
+                    let! projected = get (Routes.message session id)
+                    return projected |> Result.map (Option.exists (matches true))
+                | Ok _ -> return Error(Unreachable "malformed inbox response")
         }
 
     /// Stream events until the connection ends.
@@ -389,7 +490,7 @@ type OpenCodeClient private (locate: unit -> Result<ServiceEndpoint, ApiError>, 
     /// Returns `Ok` on a clean close and an error otherwise; in both cases the caller
     /// is expected to reconnect, because the stream ending is normal — it fails on
     /// overflow by design (DESIGN.md §9).
-    member _.ReadEvents(onFrame: EventFrame -> unit, ct: CancellationToken) : Async<Result<unit, ApiError>> =
+    member _.ReadEvents(onFrame: EventFrame -> unit, ct: CancellationToken, ?onConnected: unit -> unit) : Async<Result<unit, ApiError>> =
         async {
             match endpoint () with
             | Error error -> return Error error
@@ -401,20 +502,27 @@ type OpenCodeClient private (locate: unit -> Result<ServiceEndpoint, ApiError>, 
                     request.Headers.Authorization <- authorisation service
                     request.Headers.Accept.Add(MediaTypeWithQualityHeaderValue "text/event-stream")
 
+                    use handshake = CancellationTokenSource.CreateLinkedTokenSource ct
+                    handshake.CancelAfter requestTimeout
                     use! response =
-                        http.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, ct)
+                        http.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, handshake.Token)
                         |> Async.AwaitTask
 
                     if not response.IsSuccessStatusCode then
-                        let! body = response.Content.ReadAsStringAsync ct |> Async.AwaitTask
+                        let! body = response.Content.ReadAsStringAsync handshake.Token |> Async.AwaitTask
                         return Error(Rejected(int response.StatusCode, body.Trim()))
                     else
+                        handshake.CancelAfter Timeout.InfiniteTimeSpan
+                        onConnected |> Option.iter (fun notify -> notify())
                         use! stream = response.Content.ReadAsStreamAsync ct |> Async.AwaitTask
                         use reader = new StreamReader(stream)
                         do! Sse.pump reader onFrame ct
                         return Ok()
                 with
-                | :? OperationCanceledException -> return Ok()
+                | :? OperationCanceledException when ct.IsCancellationRequested -> return Ok()
+                | :? OperationCanceledException ->
+                    forget ()
+                    return Error(Unreachable "event stream connection deadline exceeded")
                 | error ->
                     forget ()
                     return Error(Unreachable error.Message)

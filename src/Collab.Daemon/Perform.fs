@@ -1,85 +1,78 @@
-/// Turning the router's decisions into deliveries.
-///
-/// The router does not do IO and the adapters do not make decisions, so this is the
-/// join. It contains no policy of its own: every branch here is a direct consequence of
-/// which `Intent` it was handed.
+/// Execute delivery intents and acknowledge every admission to the engine.
 namespace Collab.Daemon
 
 open Collab.Domain
 
 module Perform =
-
-    /// Which adapter serves a harness. A function rather than a fixed adapter because a
-    /// second one (Claude Code, P3) puts two harnesses in one namespace, and delivery
-    /// must then follow the endpoint rather than the daemon's configuration.
     type Ports = HarnessKind -> HarnessPort option
 
-    let private deliver (ports: Ports) (endpoint: Endpoint) (envelope: Envelope) =
+    let private deliver ports endpoint envelope =
         async {
-            match ports endpoint.Harness with
-            | Some port -> return! port.Deliver(endpoint, envelope)
-            | None ->
-                // Status 0 says no request was made: this is a routing mistake, not a
-                // harness that refused us.
-                return Error(HarnessRejected(0, $"no adapter is loaded for {endpoint.Harness}"))
+            try
+                match ports endpoint.Harness with
+                | Some (port: HarnessPort) -> return! port.Deliver(endpoint, envelope)
+                | None -> return Error(HarnessRejected(0, $"no adapter is loaded for {endpoint.Harness}"))
+            with error ->
+                // A throwing adapter cannot establish that admission did not happen.
+                return Error(AdmissionUnknown error.Message)
         }
 
-    /// Carry out one decision.
-    ///
-    /// Returns an outcome only where there is a caller waiting to hear it. A flush, a
-    /// bounce and a binding change all happen on their own account: their audience has
-    /// either already been told or is not the one that triggered them.
-    let intent (ports: Ports) (clock: Clock) (intent: Intent) : Async<DeliveryOutcome option> =
+    let private report (engine: Engine) (clock: Clock) endpoint envelope result =
+        async {
+            do! engine.Completed(endpoint, envelope, result)
+            match result with
+            | Admitted -> return Delivered(clock.Now())
+            | NotAdmitted(AdmissionUnknown _ as fault)
+            | NotAdmitted(HarnessRejected _ as fault) -> return Failed fault
+            | Deferred | NotAdmitted _ ->
+                let! state = engine.Snapshot()
+                match state.Pending |> List.tryFind (fun p -> p.Envelope.Id = envelope.Id) with
+                | Some mail -> return Parked(mail.ParkedAt, mail.ExpiresAt)
+                | None -> return Failed(HarnessRejected(0, "delivery state disappeared before its acknowledgement"))
+        }
+
+    let intent ports (clock: Clock) (engine: Engine) intent : Async<DeliveryOutcome list> =
         async {
             match intent with
             | PushTo(endpoint, envelope) ->
-                match! deliver ports endpoint envelope with
-                | Ok() -> return Some(Delivered(clock.Now()))
-                | Error fault -> return Some(Failed fault)
-
-            | Park(_, until) -> return Some(Parked(clock.Now(), until))
-
-            | Decline refusal -> return Some(Refused refusal)
-
-            | ReturnToSender(endpoint, envelope, reason) ->
-                let! result = deliver ports endpoint (Envelope.bounce (clock.Now()) reason envelope)
-
-                match result with
-                | Ok() -> Log.write $"bounced to {AgentName.value envelope.From}: {reason}"
-                | Error fault -> Log.write $"bounce to {AgentName.value envelope.From} failed: {fault}"
-
-                return None
-
+                let! result = deliver ports endpoint envelope
+                let! outcome = report engine clock endpoint envelope
+                                    (match result with Ok() -> Admitted | Error fault -> NotAdmitted fault)
+                return [ outcome ]
             | Flush(endpoint, envelopes) ->
-                // In send order, and one at a time: a backlog that arrives shuffled
-                // reads as a different conversation than the one that was held.
+                let outcomes = ResizeArray<DeliveryOutcome>()
+                let mutable stopped = false
                 for envelope in envelopes do
-                    let! result = deliver ports endpoint envelope
-
-                    match result with
-                    | Ok() -> Log.write $"flushed to {AgentName.value envelope.To} from {AgentName.value envelope.From}"
-                    | Error fault -> Log.write $"flush to {AgentName.value envelope.To} failed: {fault}"
-
-                return None
-
+                    let! result =
+                        async {
+                            if stopped then return Deferred
+                            else
+                                match! deliver ports endpoint envelope with
+                                | Ok() -> return Admitted
+                                | Error fault ->
+                                    stopped <- true
+                                    return NotAdmitted fault
+                        }
+                    let! outcome = report engine clock endpoint envelope result
+                    outcomes.Add outcome
+                return List.ofSeq outcomes
+            | Park(envelope, until) -> return [ Parked(envelope.SentAt, until) ]
+            | Decline refusal -> return [ Refused refusal ]
             | CompleteClaim(name, endpoint) ->
                 let (SessionId session) = endpoint.Session
                 let (Scope directory) = endpoint.Scope
                 Log.write $"bound {AgentName.value name} to {session} in {directory}"
-                return None
-
+                return []
             | ReleaseBinding name ->
                 Log.write $"released {AgentName.value name}"
-                return None
+                return []
         }
 
-    let all (ports: Ports) (clock: Clock) (intents: Intent list) : Async<DeliveryOutcome list> =
+    let all ports clock engine intents : Async<DeliveryOutcome list> =
         async {
             let outcomes = ResizeArray<DeliveryOutcome>()
-
             for one in intents do
-                let! outcome = intent ports clock one
-                outcome |> Option.iter outcomes.Add
-
+                let! next = intent ports clock engine one
+                for outcome in next do outcomes.Add outcome
             return List.ofSeq outcomes
         }

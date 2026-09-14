@@ -26,6 +26,12 @@ module EventTypes =
     [<Literal>]
     let ToolProgress = "session.tool.progress"
 
+    [<Literal>]
+    let ToolInputStarted = "session.tool.input.started"
+
+    [<Literal>]
+    let ToolCalled = "session.tool.called"
+
     /// A session has gone. Its binding must be released.
     [<Literal>]
     let SessionDeleted = "session.deleted"
@@ -41,6 +47,32 @@ type Observation =
     | SessionDeleted of endpoint: Endpoint
 
 module Mapping =
+
+    /// This is the server key in the supported OpenCode configuration.
+    [<Literal>]
+    let ServerName = "collab"
+
+    /// Newer harnesses carry session context outside model-visible tool arguments.
+    /// The namespaced key is in current source; the plain key is in public V2 docs.
+    /// Malformed or conflicting context must never fall back to argument-only matching.
+    let sessionMetadata (metadata: JsonNode option) : Result<SessionId, string> =
+        let read key (object': JsonObject) =
+            if not (object'.ContainsKey key) then
+                Ok None
+            else
+                match Json.stringField key object' with
+                | Some value when not (String.IsNullOrWhiteSpace value) -> Ok(Some(SessionId value))
+                | _ -> Error $"'{key}' must be a nonempty session ID"
+
+        match metadata with
+        | None -> Error "session metadata is required; use an OC2 runtime that supplies MCP session context"
+        | Some(:? JsonObject as object') ->
+            match read "ai.opencode/sessionID" object', read "sessionID" object' with
+            | Error error, _ | _, Error error -> Error error
+            | Ok(Some a), Ok(Some b) when a <> b -> Error "session metadata keys disagree"
+            | Ok(Some session), _ | _, Ok(Some session) -> Ok session
+            | _ -> Error "session metadata is required; expected ai.opencode/sessionID or sessionID"
+        | Some _ -> Error "MCP metadata must be an object"
 
     /// The mapping the whole design turns on.
     ///
@@ -63,8 +95,10 @@ module Mapping =
     /// reply-to to render yet.
     let render (envelope: Envelope) : SyntheticMessage =
         let sender = AgentName.value envelope.From
+        let (MessageId id) = envelope.Id
 
-        { Text = $"[peer {sender}]: {envelope.Body}"
+        { Id = Some("msg_" + id.ToString "N")
+          Text = $"[peer {sender}]: {envelope.Body}"
           Description = Some $"peer message from {sender}"
           Delivery = delivery envelope.Urgency }
 
@@ -76,19 +110,23 @@ module Mapping =
     /// and a frame lacking it is dropped rather than guessed at.
     let private endpointOf (frame: EventFrame) (session: string) : Endpoint option =
         frame.Directory
-        |> Option.map (fun directory ->
-            { Harness = HarnessKind.OpenCode
-              Session = SessionId session
-              Scope = Scope directory })
+        |> Option.bind (fun directory ->
+            try
+                if String.IsNullOrWhiteSpace session || not (System.IO.Path.IsPathFullyQualified directory) then None
+                else
+                    Some
+                        { Harness = HarnessKind.OpenCode
+                          Session = SessionId session
+                          Scope = Scope(Scope.key (Scope directory)) }
+            with _ -> None)
 
-    /// opencode namespaces an MCP tool as `<server>.<tool>`, where the server half is
-    /// whatever name the user gave it in their config. The router knows the tool it was
-    /// called as and nothing about that config, so the prefix is dropped here — it is
-    /// opencode's convention, and this is the file that owns opencode's conventions.
-    let private bareTool (qualified: string) : string =
-        match qualified.LastIndexOf '.' with
-        | -1 -> qualified
-        | dot -> qualified.Substring(dot + 1)
+    /// Only this server's progress can attribute this server's calls.
+    let private bareTool (qualified: string) : string option =
+        let prefix = ServerName + "."
+        if qualified.StartsWith(prefix, StringComparison.Ordinal) then
+            Some(qualified.Substring prefix.Length)
+        else
+            None
 
     /// What identifies one MCP call.
     ///
@@ -98,8 +136,10 @@ module Mapping =
     /// model provider rather than by opencode, and at least one provider issues the
     /// literal `tool_0` for every call in a session. The assistant step is what actually
     /// separates them.
-    let private callIdentity (step: string) (callId: string) (index: int) : string =
-        $"{step}#{callId}#{index}"
+    let private callIdentity (endpoint: Endpoint) (step: string) (callId: string) (index: int) : string =
+        let (SessionId session) = endpoint.Session
+        let (Scope directory) = endpoint.Scope
+        System.Text.Json.JsonSerializer.Serialize [ directory; session; step; callId; string index ]
 
     /// The MCP calls a progress frame reports as having just started.
     let private startedIn (data: JsonNode) : (int * ToolInvocation) list =
@@ -125,7 +165,7 @@ module Mapping =
                             |> Option.map (fun node -> node.ToJsonString())
                             |> Option.defaultValue "{}"
 
-                        Some(index, { Tool = bareTool tool; Input = input })
+                        bareTool tool |> Option.map (fun bare -> index, { Tool = bare; Input = input })
                     | _ -> None)
             |> Seq.toList
         | _ -> []
@@ -140,7 +180,7 @@ module Mapping =
             | Some endpoint, Some callId, Some step ->
                 startedIn frame.Data
                 |> List.map (fun (index, invocation) ->
-                    McpToolCalled(endpoint, callIdentity step callId index, invocation))
+                    McpToolCalled(endpoint, callIdentity endpoint step callId index, invocation))
             | _ -> []
         | EventTypes.SessionDeleted ->
             field "sessionID"
@@ -148,6 +188,38 @@ module Mapping =
             |> Option.map SessionDeleted
             |> Option.toList
         | _ -> []
+
+    /// New or reopened sessions, plus first execution as a fallback after missed events.
+    let sessionAvailable (frame: EventFrame) =
+        if List.contains frame.Type [ "session.created"; "session.viewed"; "session.execution.started" ] then
+            Json.stringField "sessionID" frame.Data |> Option.bind (endpointOf frame)
+        else None
+
+    /// Direct calls split tool name and input across two events.
+    let directIdentity (frame: EventFrame) =
+        match Json.stringField "sessionID" frame.Data |> Option.bind (endpointOf frame),
+              Json.stringField "assistantMessageID" frame.Data, Json.stringField "id" frame.Data with
+        | Some endpoint, Some step, Some id -> Some(endpoint, callIdentity endpoint step id 0)
+        | _ -> None
+
+    let directStarted (frame: EventFrame) =
+        if frame.Type <> EventTypes.ToolInputStarted then None
+        else
+            match directIdentity frame, Json.stringField "name" frame.Data with
+            | Some(_, identity), Some qualified ->
+                let prefix = ServerName + "_"
+                if qualified.StartsWith(prefix, StringComparison.Ordinal) then
+                    let tool = qualified.Substring prefix.Length
+                    if List.contains tool [ "hello"; "roster"; "send" ] then Some(identity, tool) else None
+                else None
+            | _ -> None
+
+    let directCalled (tool: string) (frame: EventFrame) =
+        if frame.Type <> EventTypes.ToolCalled || not (List.contains tool [ "hello"; "roster"; "send" ]) then []
+        else
+            directIdentity frame |> Option.map (fun (endpoint, identity) ->
+                let input = Json.field "input" frame.Data |> Option.map (fun n -> n.ToJsonString()) |> Option.defaultValue "{}"
+                McpToolCalled(endpoint, identity, { Tool = tool; Input = input })) |> Option.toList
 
 module Faults =
 
@@ -160,6 +232,7 @@ module Faults =
         | ApiError.Unreachable detail -> HarnessUnreachable detail
         | ApiError.SessionNotFound _ -> SessionGone endpoint
         | ApiError.Rejected(status, detail) -> HarnessRejected(status, detail)
+        | ApiError.AdmissionUnknown detail -> Collab.Domain.AdmissionUnknown detail
 
 /// Sandbox calls we have already reported.
 ///
@@ -183,6 +256,19 @@ type internal Reported(capacity: int) =
                 true
             else
                 false)
+
+/// Bounded name context awaiting the direct call's arguments.
+type internal DirectCalls(capacity: int) =
+    let gate = obj ()
+    let names = System.Collections.Generic.Dictionary<string, string>()
+    let order = System.Collections.Generic.Queue<string>()
+    member _.Remember(identity, tool) = lock gate (fun () ->
+        if names.TryAdd(identity, tool) then order.Enqueue identity
+        while order.Count > capacity do names.Remove(order.Dequeue()) |> ignore)
+    member _.Take(identity) = lock gate (fun () ->
+        match names.TryGetValue identity with
+        | true, tool -> names.Remove identity |> ignore; Some tool
+        | _ -> None)
 
 /// Multicast for the event stream.
 ///
@@ -215,6 +301,11 @@ type internal Broadcast<'T>() =
 /// Deliver is one POST. Observe is one long-lived subscription to the daemon-wide
 /// event stream, shared by every subscriber: the daemon has one bus, and opening a
 /// connection per subscriber would multiply the overflow risk for no gain.
+type EventConnection =
+    | Connecting
+    | Connected
+    | Disconnected of detail: string
+
 type OpenCodeAdapter private (client: OpenCodeClient, ownsClient: bool) =
 
     /// How long to wait before reconnecting a stream that ended. Long enough not to
@@ -225,23 +316,41 @@ type OpenCodeAdapter private (client: OpenCodeClient, ownsClient: bool) =
     /// costs a duplicate report, which attribution then consumes against a call that
     /// has already been answered — so it is sized generously.
     let reported = Reported 4096
+    let directCalls = DirectCalls 4096
 
     let events = Broadcast<HarnessEvent>()
+    let sessions = Broadcast<Endpoint>()
+    let connections = Broadcast<EventConnection>()
+    let mutable connection = Connecting
     let cancellation = new CancellationTokenSource()
     let gate = obj ()
     let mutable pumping = false
 
     let handle (frame: EventFrame) =
-        for observation in Mapping.observe frame do
+        Mapping.sessionAvailable frame |> Option.iter sessions.Publish
+        Mapping.directStarted frame |> Option.iter (fun (identity, tool) -> directCalls.Remember(identity, tool))
+        let direct =
+            if frame.Type = EventTypes.ToolCalled then
+                Mapping.directIdentity frame |> Option.bind (fun (_, identity) -> directCalls.Take identity)
+                |> Option.map (fun tool -> Mapping.directCalled tool frame) |> Option.defaultValue []
+            else []
+        for observation in Mapping.observe frame @ direct do
             match observation with
             | McpToolCalled(endpoint, call, invocation) ->
                 if reported.IsNew call then
                     events.Publish(AgentInvoked(endpoint, invocation))
             | SessionDeleted endpoint -> events.Publish(SessionEnded endpoint)
 
+    let connectionChanged status =
+        lock gate (fun () -> connection <- status)
+        connections.Publish status
+
     let rec pump () =
         async {
-            let! _ = client.ReadEvents(handle, cancellation.Token)
+            connectionChanged Connecting
+            let! result = client.ReadEvents(handle, cancellation.Token, onConnected = (fun () -> connectionChanged Connected))
+            if not cancellation.IsCancellationRequested then
+                connectionChanged (Disconnected(match result with Ok () -> "stream closed" | Error error -> sprintf "%A" error))
 
             // A failed stream and a restarted daemon are answered the same way, so we
             // do not distinguish them: reconnect, and let the client rediscover the
@@ -265,6 +374,18 @@ type OpenCodeAdapter private (client: OpenCodeClient, ownsClient: bool) =
 
     /// Discover the daemon and hold the connection for this adapter's lifetime.
     new() = new OpenCodeAdapter(new OpenCodeClient(), true)
+
+    member _.FindAdmission(endpoint: Endpoint, envelope: Envelope) =
+        let (SessionId session) = endpoint.Session
+        client.FindSynthetic(session, Mapping.render envelope)
+
+    member _.Sessions = sessions :> IObservable<Endpoint>
+    member _.HasCollab(endpoint: Endpoint) =
+        let (Scope directory) = endpoint.Scope
+        client.HasServer(directory, Mapping.ServerName)
+
+    member _.Connection = lock gate (fun () -> connection)
+    member _.Connections = connections :> IObservable<EventConnection>
 
     interface HarnessPort with
 

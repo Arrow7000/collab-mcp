@@ -20,7 +20,10 @@ module Paths =
     /// credentials and can steer any session (DESIGN.md §8), so nothing here is
     /// readable by anyone else.
     let directory () : string =
-        let path = Path.Combine(home (), ".collab-mcp")
+        let path =
+            match Environment.GetEnvironmentVariable "COLLAB_MCP_HOME" with
+            | null | "" -> Path.Combine(home (), ".collab-mcp")
+            | configured -> Path.GetFullPath configured
 
         if not (Directory.Exists path) then
             Directory.CreateDirectory path |> ignore
@@ -42,6 +45,7 @@ module Paths =
     let spawnLock () : string = Path.Combine(directory (), "spawn.lock")
 
     let log () : string = Path.Combine(directory (), "daemon.log")
+    let database () : string = Path.Combine(directory (), "state.sqlite")
 
 /// The daemon is started detached and has no terminal, so this is the only account of
 /// what it did. Written to stdout, which the shim redirects to `Paths.log`.

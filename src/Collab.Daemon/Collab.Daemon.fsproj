@@ -10,6 +10,7 @@
     <Compile Include="Runtime.fs" />
     <Compile Include="Protocol.fs" />
     <Compile Include="Attribution.fs" />
+    <Compile Include="Store.fs" />
     <Compile Include="Engine.fs" />
     <Compile Include="Perform.fs" />
     <Compile Include="Daemon.fs" />
@@ -17,6 +18,10 @@
 
   <ItemGroup>
     <ProjectReference Include="..\Collab.Adapters.OpenCode\Collab.Adapters.OpenCode.fsproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.Data.Sqlite" Version="10.0.12" />
   </ItemGroup>
 
 </Project>

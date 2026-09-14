@@ -14,5 +14,9 @@ module Program =
     let main argv =
         if Array.contains "--daemon" argv then
             Daemon.run ()
+        elif Array.contains "--status" argv then
+            let answer = Client.status () |> Async.RunSynchronously
+            System.Console.WriteLine answer.Text
+            if answer.Ok then 0 else 1
         else
             Mcp.serve ()

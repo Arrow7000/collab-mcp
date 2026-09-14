@@ -75,20 +75,20 @@ module AgentName =
 
     /// Total constructor. Rejects rather than repairs.
     let create (raw: string) : Result<AgentName, NameError> =
-        let trimmed = if isNull raw then "" else raw.Trim()
+        let original = if isNull raw then "" else raw
 
-        if String.IsNullOrEmpty trimmed then
+        if String.IsNullOrWhiteSpace original then
             Error Empty
-        elif trimmed.Length > MaxLength then
-            Error(TooLong(trimmed.Length, MaxLength))
+        elif original.Length > MaxLength then
+            Error(TooLong(original.Length, MaxLength))
         else
             let offending =
-                trimmed |> Seq.filter (isLegal >> not) |> Seq.distinct |> Seq.toArray |> String
+                original |> Seq.filter (isLegal >> not) |> Seq.distinct |> Seq.toArray |> String
 
             if offending.Length > 0 then
                 Error(IllegalCharacters offending)
             else
-                Ok(AgentName trimmed)
+                Ok(AgentName original)
 
     let value (AgentName n) : string = n
 
@@ -100,10 +100,10 @@ module AgentName =
 
 module Scope =
 
-    /// Canonical form for comparison. Trailing separators and case differences must not
-    /// split one project into two namespaces.
+    /// Harness directories are absolute. Normalize syntax but preserve case so distinct
+    /// projects on case-sensitive filesystems cannot be merged. Path aliases are separate.
     let key (Scope directory) : string =
-        directory.TrimEnd('/').ToLowerInvariant()
+        directory |> System.IO.Path.GetFullPath |> System.IO.Path.TrimEndingDirectorySeparator
 
 module Binding =
 

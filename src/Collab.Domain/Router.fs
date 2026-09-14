@@ -1,239 +1,262 @@
-/// The router's own state and decisions, as data.
-///
-/// Everything here is pure: a decision maps (state, input) to a new state plus intents,
-/// and the daemon performs them. That keeps routing testable without a harness, a socket
-/// or a real clock.
+/// Routing decisions and the outbox are pure data; the daemon owns delivery IO.
 namespace Collab.Domain
 
 open System
 
-/// What the router knows about one identity.
-///
-/// Scoped: a name is unique within a project, not across the machine, so unrelated
-/// repositories cannot collide on `RedStone`.
-///
-/// TODO(P2): carry `LastActive`, and let `roster` filter on it. Without that a
-/// long-lived daemon accumulates every name ever used in a project, and an agent asking
-/// who its peers are gets months of ghosts.
 type Registration =
     { Name: AgentName
       Scope: Scope
       Binding: Binding
-      FirstSeen: DateTimeOffset }
+      FirstSeen: DateTimeOffset
+      Provisional: bool }
 
-/// Mail held because nothing is bound to the recipient's name. Ordered, so a session
-/// that binds receives its backlog in the order it was sent.
-type ParkedMail =
+type PendingStatus =
+    | Waiting of retryAfter: DateTimeOffset
+    | Delivering of Endpoint
+    | Uncertain of endpoint: Endpoint * detail: string
+
+type MailPurpose = PeerMessage | FailureNotice
+
+/// Accepted mail stays here until admission is confirmed or a failure notice replaces it.
+type PendingMail =
     { Envelope: Envelope
       Scope: Scope
       ParkedAt: DateTimeOffset
-      ExpiresAt: DateTimeOffset }
+      ExpiresAt: DateTimeOffset
+      Status: PendingStatus
+      Purpose: MailPurpose }
 
-/// The router's whole state. A value, so it can be rebuilt by replaying the log.
 type RouterState =
     { Registrations: Map<string, Registration>
-      Parked: ParkedMail list }
+      Pending: PendingMail list }
 
-/// The one tunable that survived the cut to a minimal first version.
 type Limits =
-    { /// How long undeliverable mail is held before being returned to its sender.
-      /// Sized for a peer that is still booting, not for one that never arrives.
-      ParkWindow: TimeSpan }
+    { ParkWindow: TimeSpan
+      MaxBodyBytes: int
+      MaxPending: int
+      MaxMailboxPeers: int }
 
-/// What the router has decided to do. The daemon performs these; the domain never
-/// touches IO.
 type Intent =
-    /// Push now to a bound endpoint.
     | PushTo of endpoint: Endpoint * envelope: Envelope
-    /// Hold: nothing is bound to the recipient's name yet.
     | Park of envelope: Envelope * until: DateTimeOffset
-    /// The hold expired without anyone claiming the name. Wake the *sender* and tell it,
-    /// so an unroutable message surfaces through the same push path as any other rather
-    /// than vanishing.
-    ///
-    /// Carries the sender's endpoint rather than leaving it to be looked up: only the
-    /// router knows where that name is bound, and a sender that has itself gone away in
-    /// the meantime has nowhere to be told, which is a decision worth making here where
-    /// it is testable rather than at the point of performing IO.
-    | ReturnToSender of to': Endpoint * envelope: Envelope * reason: string
-    /// Tell the sender no, with a reason it can act on.
     | Decline of Refusal
-    /// Bind a name to the session that just proved it owns it.
     | CompleteClaim of name: AgentName * endpoint: Endpoint
-    /// Release a binding whose session has gone.
     | ReleaseBinding of name: AgentName
-    /// Deliver a parked backlog, in send order, to a session that has just bound.
-    /// Binding is the only trigger: an already-bound session is delivered to directly,
-    /// idle or not.
+    /// Each item is acknowledged separately. Stop after the first failed admission.
     | Flush of endpoint: Endpoint * envelopes: Envelope list
 
 module Limits =
-
-    /// Long enough for a subagent to boot and announce itself, short enough that a
-    /// misaddressed message comes back while its sender still has the context to care.
-    let defaults: Limits = { ParkWindow = TimeSpan.FromSeconds 90.0 }
+    let defaults: Limits =
+        { ParkWindow = TimeSpan.FromSeconds 90.0
+          MaxBodyBytes = 16 * 1024; MaxPending = 512; MaxMailboxPeers = 64 }
 
 module RouterState =
-
-    /// Unit separator. Cannot occur in a name (see `AgentName`), so no two distinct
-    /// scope/name pairs can collide on one key.
     let private sep = string (char 0x1F)
-
-    let empty: RouterState =
-        { Registrations = Map.empty; Parked = [] }
-
-    /// Registrations are keyed by scope and name together; a lookup without a scope is
-    /// meaningless.
-    let key (scope: Scope) (name: AgentName) : string =
-        Scope.key scope + sep + AgentName.key name
-
-    let lookup (scope: Scope) (name: AgentName) (state: RouterState) : Registration option =
-        Map.tryFind (key scope name) state.Registrations
-
-    /// Which identity a session currently owns.
-    ///
-    /// This is the reverse of the lookup above, and it is how a call gets a sender: the
-    /// harness says which session spoke, and this says which name that session answers
-    /// to. An agent is therefore never asked who it is.
-    let boundTo (endpoint: Endpoint) (state: RouterState) : Registration option =
-        state.Registrations
-        |> Map.toSeq
-        |> Seq.map snd
+    let empty: RouterState = { Registrations = Map.empty; Pending = [] }
+    let key (scope: Scope) (name: AgentName) = Scope.key scope + sep + AgentName.key name
+    let lookup (scope: Scope) (name: AgentName) (state: RouterState) = Map.tryFind (key scope name) state.Registrations
+    let boundTo (endpoint: Endpoint) (state: RouterState) =
+        state.Registrations |> Map.toSeq |> Seq.map snd
         |> Seq.tryFind (fun r -> Binding.endpoint r.Binding = Some endpoint)
 
 module Router =
-
-    /// Everyone the asking agent could talk to in its project.
-    ///
-    /// This is what lets peers find each other without their names being written into
-    /// their prompts. Only the agent that starts *second* needs it: the first does not
-    /// have to find anyone, because the second one finds it and sends, and push delivery
-    /// wakes it. So discovery never has to wait or poll.
-    let roster (scope: Scope) (state: RouterState) : Registration list =
-        state.Registrations
-        |> Map.toList
-        |> List.map snd
+    let roster (scope: Scope) (state: RouterState) =
+        state.Registrations |> Map.toList |> List.map snd
         |> List.filter (fun r -> Scope.key r.Scope = Scope.key scope)
         |> List.sortBy (fun r -> AgentName.key r.Name)
 
-    /// An agent announces the name it wishes to be known by.
-    ///
-    /// The endpoint is not a parameter the agent could ever influence. MCP tells a
-    /// server nothing about its caller, so the daemon recovers the calling session from
-    /// the harness's own event stream before it gets here (Ports.fs), and by this point
-    /// the session and its project are facts the harness reported. A name is the whole
-    /// of what the agent contributes.
-    ///
-    /// Rebinding is deliberate rather than an error: an identity outlives a session, so
-    /// a restarted agent announcing the same name takes its mailbox back, along with
-    /// anything that parked while it was away.
-    let claim
-        (now: DateTimeOffset)
-        (name: AgentName)
-        (endpoint: Endpoint)
-        (state: RouterState)
-        : RouterState * Intent list =
-        let scope = endpoint.Scope
-        let k = RouterState.key scope name
+    let private forMailbox scope name (mail: PendingMail) =
+        Scope.key mail.Scope = Scope.key scope && AgentName.equivalent mail.Envelope.To name
 
-        let registration =
-            { Name = name
-              Scope = scope
-              Binding = Bound(endpoint, now)
-              FirstSeen =
-                state.Registrations
-                |> Map.tryFind k
-                |> Option.map (fun r -> r.FirstSeen)
-                |> Option.defaultValue now }
+    let private release (endpoint: Endpoint) (state: RouterState) =
+        let registrations, intents =
+            state.Registrations
+            |> Map.fold (fun (registrations, intents) key registration ->
+                if Binding.endpoint registration.Binding = Some endpoint then
+                    Map.add key { registration with Binding = Unbound } registrations,
+                    ReleaseBinding registration.Name :: intents
+                else registrations, intents) (state.Registrations, [])
+        { state with Registrations = registrations }, List.rev intents
 
-        let mine, others =
-            state.Parked
-            |> List.partition (fun p ->
-                Scope.key p.Scope = Scope.key scope && AgentName.equivalent p.Envelope.To name)
+    let private notice now (mail: PendingMail) envelope =
+        { Envelope = envelope
+          Scope = mail.Scope
+          ParkedAt = now
+          ExpiresAt = now + Limits.defaults.ParkWindow
+          Status = Waiting now
+          Purpose = FailureNotice }
 
-        let state' =
-            { state with
-                Registrations = Map.add k registration state.Registrations
-                Parked = others }
+    /// Expiry never races a request in flight or treats uncertain admission as failure.
+    /// Failure notices are retained for a returning sender but cannot bounce in a loop.
+    let private expirePending now state =
+        let dead, live = state.Pending |> List.partition (fun mail ->
+            match mail.Status with
+            | Waiting _ -> mail.ExpiresAt <= now
+            | Delivering _ | Uncertain _ -> false)
+        let notices = dead |> List.choose (fun mail ->
+            match mail.Purpose with
+            | FailureNotice -> None
+            | PeerMessage ->
+                Some(notice now mail (Envelope.bounce now "the delivery deadline expired" mail.Envelope)))
+        { state with Pending = live @ notices }
 
-        let flush =
-            if List.isEmpty mine then
-                []
+    /// Serialize admissions per mailbox. An uncertain head blocks later messages;
+    /// otherwise they could pass a message whose admission we cannot establish.
+    let private prepareBacklog (now: DateTimeOffset) (endpoint: Endpoint) (state: RouterState) =
+        let target = RouterState.boundTo endpoint state
+        match target with
+        | None -> state, []
+        | Some registration ->
+            let backlog = state.Pending |> List.filter (forMailbox registration.Scope registration.Name)
+            let ready = backlog |> List.takeWhile (fun mail ->
+                match mail.Status with
+                | Waiting retryAfter -> retryAfter <= now && mail.ExpiresAt > now
+                | Delivering _ | Uncertain _ -> false)
+            if List.isEmpty ready then state, []
             else
-                [ Flush(endpoint, mine |> List.map (fun p -> p.Envelope)) ]
+                let ids = ready |> List.map (fun m -> m.Envelope.Id) |> Set.ofList
+                let pending = state.Pending |> List.map (fun mail ->
+                    if Set.contains mail.Envelope.Id ids then { mail with Status = Delivering endpoint }
+                    else mail)
+                let envelopes = ready |> List.map _.Envelope
+                let intent =
+                    match envelopes with
+                    | [ envelope ] -> PushTo(endpoint, envelope)
+                    | _ -> Flush(endpoint, envelopes)
+                let k = RouterState.key registration.Scope registration.Name
+                let registrations = Map.add k { registration with Provisional = false } state.Registrations
+                { state with Pending = pending; Registrations = registrations }, [ intent ]
 
-        state', CompleteClaim(name, endpoint) :: flush
+    /// Repeat hello preserves identity. Live collisions and renaming are refused.
+    /// Expire overdue mail before binding so timer scheduling cannot extend deadlines.
+    let claim (now: DateTimeOffset) (name: AgentName) (endpoint: Endpoint) (state: RouterState) : RouterState * Intent list =
+        let bind state =
+            let k = RouterState.key endpoint.Scope name
+            let registration =
+                { Name = name; Scope = endpoint.Scope; Binding = Bound(endpoint, now); Provisional = false
+                  FirstSeen = RouterState.lookup endpoint.Scope name state
+                              |> Option.map _.FirstSeen |> Option.defaultValue now }
+            let state = { state with Registrations = Map.add k registration state.Registrations }
+            let state, delivery = prepareBacklog now endpoint state
+            state, CompleteClaim(name, endpoint) :: delivery
+        match RouterState.boundTo endpoint state with
+        | Some current when AgentName.equivalent current.Name name ->
+            let k = RouterState.key current.Scope current.Name
+            let state = { state with Registrations = Map.add k { current with Provisional = false } state.Registrations }
+            let state, delivery = prepareBacklog now endpoint (expirePending now state)
+            state, CompleteClaim(current.Name, endpoint) :: delivery
+        | Some current when current.Provisional ->
+            match RouterState.lookup endpoint.Scope name state with
+            | Some { Binding = Bound _ } -> state, [ Decline(NameInUse name) ]
+            | _ -> bind { state with Registrations = Map.remove (RouterState.key current.Scope current.Name) state.Registrations }
+        | Some current -> state, [ Decline(AlreadyNamed(current.Name, name)) ]
+        | None ->
+            match RouterState.lookup endpoint.Scope name state with
+            | Some { Binding = Bound _ } -> state, [ Decline(NameInUse name) ]
+            | _ -> bind (expirePending now state)
 
-    /// The main decision.
-    ///
-    /// `scope` and `from` are resolved by the daemon from the session that made the
-    /// call, never read out of the request: an agent says who it is writing *to*, and
-    /// nothing about who it is.
-    let send
-        (now: DateTimeOffset)
-        (limits: Limits)
-        (scope: Scope)
-        (from: AgentName)
-        (request: SendRequest)
-        (state: RouterState)
-        : RouterState * Intent list =
-        if AgentName.equivalent from request.To then
-            state, [ Decline(SelfAddressed request.To) ]
+    /// Every accepted send enters the outbox before IO, including bound recipients.
+    let send (now: DateTimeOffset) (limits: Limits) (scope: Scope) (from: AgentName) (request: SendRequest) (state: RouterState) : RouterState * Intent list =
+        let state = expirePending now state
+        let bytes = System.Text.Encoding.UTF8.GetByteCount request.Body
+        let peers = state.Pending |> List.filter (fun mail -> mail.Purpose = PeerMessage)
+        let mailboxPeers = peers |> List.filter (forMailbox scope request.To) |> List.length
+        if AgentName.equivalent from request.To then state, [ Decline(SelfAddressed request.To) ]
+        elif bytes > limits.MaxBodyBytes then state, [ Decline(MessageTooLarge(bytes, limits.MaxBodyBytes)) ]
+        // Reserve half the bounded outbox for failure notices; uncertain peers may need one.
+        elif peers.Length >= limits.MaxPending / 2 || state.Pending.Length >= limits.MaxPending - 1 then
+            state, [ Decline(QueueFull "the router outbox is full") ]
+        elif mailboxPeers >= limits.MaxMailboxPeers then
+            state, [ Decline(QueueFull "the recipient mailbox is full") ]
         else
             let envelope = Envelope.seal from now request
-
+            let until = now + limits.ParkWindow
+            let mail =
+                { Envelope = envelope; Scope = scope; ParkedAt = now; ExpiresAt = until
+                  Status = Waiting now; Purpose = PeerMessage }
+            let alreadyWaiting = state.Pending |> List.exists (forMailbox scope request.To)
+            let registrations =
+                state.Registrations |> Map.map (fun _ r ->
+                    if Scope.key r.Scope = Scope.key scope && (AgentName.equivalent r.Name from || AgentName.equivalent r.Name request.To)
+                    then { r with Provisional = false } else r)
+            let state = { state with Pending = state.Pending @ [ mail ]; Registrations = registrations }
             match RouterState.lookup scope request.To state with
-            | Some { Binding = Bound(endpoint = endpoint) } -> state, [ PushTo(endpoint, envelope) ]
-            | _ ->
-                let until = now + limits.ParkWindow
+            | Some { Binding = Bound(endpoint = endpoint) } when not alreadyWaiting ->
+                prepareBacklog now endpoint state
+            | _ -> state, [ Park(envelope, until) ]
 
-                let parked =
-                    { Envelope = envelope
-                      Scope = scope
-                      ParkedAt = now
-                      ExpiresAt = until }
+    /// Stable session-derived names are defaults, never substitutes for requested names.
+    let announce now (endpoint: Endpoint) (state: RouterState) =
+        match RouterState.boundTo endpoint state with
+        | Some _ -> state, []
+        | None ->
+            let (SessionId session) = endpoint.Session
+            let digest = System.Security.Cryptography.SHA256.HashData(System.Text.Encoding.UTF8.GetBytes session)
+            let raw = "oc2-" + Convert.ToHexString(digest).ToLowerInvariant().Substring(0, 16)
+            let name = AgentName.create raw |> Result.defaultWith (fun e -> failwithf "%A" e)
+            let next, intents = claim now name endpoint state
+            let k = RouterState.key endpoint.Scope name
+            match RouterState.lookup endpoint.Scope name next with
+            | Some r when Binding.endpoint r.Binding = Some endpoint ->
+                let provisional = not (next.Pending |> List.exists (forMailbox endpoint.Scope name))
+                { next with Registrations = Map.add k { r with Provisional = provisional } next.Registrations }, intents
+            | _ -> next, intents
 
-                { state with Parked = state.Parked @ [ parked ] }, [ Park(envelope, until) ]
-
-    /// Fold a harness fact into the state.
-    ///
-    /// Only one of the two facts changes routing. `AgentInvoked` exists so that a
-    /// caller-blind MCP call can be attributed to a session, and that correlation is
-    /// the daemon's: it is an artefact of how MCP is specified, not a rule about who
-    /// may talk to whom, and by the time `claim` or `send` is called the answer is
-    /// already an argument.
-    let observe (event: HarnessEvent) (state: RouterState) : RouterState * Intent list =
+    let observe (event: HarnessEvent) (state: RouterState) =
         match event with
         | AgentInvoked _ -> state, []
+        | SessionEnded endpoint -> release endpoint state
 
-        | SessionEnded endpoint ->
-            match RouterState.boundTo endpoint state with
-            | None -> state, []
-            | Some registration ->
-                let k = RouterState.key registration.Scope registration.Name
-                let released = { registration with Binding = Unbound }
+    /// Only the matching active attempt may update a pending item.
+    let completed (now: DateTimeOffset) (endpoint: Endpoint) (envelope: Envelope) (result: DeliveryResult) (state: RouterState) : RouterState =
+        match state.Pending |> List.tryFind (fun mail ->
+            mail.Envelope.Id = envelope.Id && mail.Status = Delivering endpoint) with
+        | None -> state
+        | Some mail ->
+            let remove state =
+                { state with Pending = state.Pending |> List.filter (fun p -> p.Envelope.Id <> envelope.Id) }
+            let update status state =
+                let pending =
+                    state.Pending |> List.map (fun p ->
+                        if p.Envelope.Id = envelope.Id then { p with Status = status } else p)
+                { state with Pending = pending }
+            match result with
+            | Admitted -> remove state
+            | Deferred -> update (Waiting now) state
+            | NotAdmitted(SessionGone _) ->
+                release endpoint state |> fst |> update (Waiting now)
+            | NotAdmitted(HarnessUnreachable _) -> update (Waiting(now.AddSeconds 5.)) state
+            | NotAdmitted(AdmissionUnknown detail) ->
+                let state = update (Uncertain(endpoint, detail)) state
+                match mail.Purpose with
+                | FailureNotice -> state
+                | PeerMessage ->
+                    let warning =
+                        Envelope.notice now
+                            $"Delivery to '{AgentName.value envelope.To}' is uncertain: {detail}. It may already have arrived. Do not resend; report this for reconciliation."
+                            envelope
+                    { state with Pending = state.Pending @ [ notice now mail warning ] }
+            | NotAdmitted(HarnessRejected(status, detail)) ->
+                let state = remove state
+                match mail.Purpose with
+                | FailureNotice -> state
+                | PeerMessage ->
+                    let bounce = Envelope.bounce now $"runtime rejected admission ({status}): {detail}" envelope
+                    { state with Pending = state.Pending @ [ notice now mail bounce ] }
 
-                { state with Registrations = Map.add k released state.Registrations },
-                [ ReleaseBinding registration.Name ]
+    /// Timer and recovery drive retries; agents do not need to poll or resend.
+    let expire now state : RouterState * Intent list =
+        let state = expirePending now state
+        state.Registrations |> Map.toList |> List.choose (fun (_, r) -> Binding.endpoint r.Binding)
+        |> List.fold (fun (state, intents) endpoint ->
+            let state, next = prepareBacklog now endpoint state
+            state, intents @ next) (state, [])
 
-    /// Hand back mail whose hold has run out. Driven by the clock rather than by a
-    /// decision, because a parked message expires whether or not anyone is sending.
-    let expire (now: DateTimeOffset) (state: RouterState) : RouterState * Intent list =
-        let dead, live = state.Parked |> List.partition (fun p -> p.ExpiresAt <= now)
-
-        // A sender that has itself gone away cannot be told anything, so its mail is
-        // simply dropped. Holding it further would only wait on a session that no
-        // longer exists.
-        let returns =
-            dead
-            |> List.choose (fun p ->
-                RouterState.lookup p.Scope p.Envelope.From state
-                |> Option.bind (fun r -> Binding.endpoint r.Binding)
-                |> Option.map (fun sender ->
-                    ReturnToSender(
-                        sender,
-                        p.Envelope,
-                        $"no agent claimed the name '{AgentName.value p.Envelope.To}' in time"
-                    )))
-
-        { state with Parked = live }, returns
+    /// A read proves the same synthetic input is already owned by the harness.
+    let reconciled (endpoint: Endpoint) (envelope: Envelope) (state: RouterState) =
+        let pending =
+            state.Pending |> List.filter (fun mail ->
+                match mail.Status with
+                | Uncertain(e, _) when e = endpoint && mail.Envelope.Id = envelope.Id -> false
+                | _ -> true)
+        { state with Pending = pending }

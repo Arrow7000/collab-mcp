@@ -5,4 +5,7 @@
     <Project Path="src/Collab.Domain/Collab.Domain.fsproj" />
     <Project Path="src/Collab.Shim/Collab.Shim.fsproj" />
   </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/Collab.Tests/Collab.Tests.fsproj" />
+  </Folder>
 </Solution>

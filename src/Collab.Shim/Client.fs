@@ -11,6 +11,7 @@ open System.Diagnostics
 open System.IO
 open System.Net.Sockets
 open System.Text.Json.Nodes
+open System.Threading
 open Collab.Daemon
 
 module Client =
@@ -27,13 +28,12 @@ module Client =
     let private retryDelayMs = 200
 
     let private tryConnect () : Socket option =
+        let socket = new Socket(AddressFamily.Unix, SocketType.Stream, ProtocolType.Unspecified)
         try
-            let socket =
-                new Socket(AddressFamily.Unix, SocketType.Stream, ProtocolType.Unspecified)
-
             socket.Connect(UnixDomainSocketEndPoint(Paths.socket ()))
             Some socket
         with _ ->
+            socket.Dispose()
             None
 
     let private quote (text: string) = "'" + text.Replace("'", "'\\''") + "'"
@@ -102,52 +102,46 @@ module Client =
                 return! waiting ()
         }
 
-    /// Start the daemon before serving anything, rather than when the first call needs
-    /// it.
-    ///
-    /// A daemon started by the first tool call only subscribes to the harness *after*
-    /// the event that would have attributed that call, so that call could not be
-    /// attributed and had to be retried. Measured, the gap was a few hundred
-    /// milliseconds — the model reaching its first tool call at about the speed a cold
-    /// .NET process reaches its first socket.
-    ///
-    /// Waiting here rather than in the background is what settles that race: a harness
-    /// starts a stdio server before it will run anything, so time spent here is time the
-    /// model has not yet had, and the subscription is in place before there is a call to
-    /// miss.
+    /// Start the daemon early. Socket readiness does not guarantee SSE readiness;
+    /// installed harnesses without session metadata can still lose the first fact.
     let warm () : unit =
         obtain warmTimeout
         |> Async.RunSynchronously
         |> Option.iter (fun socket -> socket.Dispose())
 
+    /// A lost answer cannot establish whether the router accepted the request.
+    let exchange (socket: Socket) (request: Call) (timeout: TimeSpan) : Async<Answer> =
+        async {
+            use deadline = new CancellationTokenSource(timeout)
+            try
+                use stream = new NetworkStream(socket, true)
+                use writer = new StreamWriter(stream, AutoFlush = true)
+                use reader = new StreamReader(stream)
+                do! writer.WriteLineAsync((Protocol.encodeCall request).AsMemory(), cancellationToken = deadline.Token)
+                    |> Async.AwaitTask
+                let! line = reader.ReadLineAsync(deadline.Token).AsTask() |> Async.AwaitTask
+                match (if isNull line then None else Protocol.decodeAnswer line) with
+                | Some answer -> return answer
+                | None -> return { Ok = false; Text = "The daemon closed the connection without an answer. The outcome is unknown; do not resend automatically." }
+            with error ->
+                socket.Dispose()
+                return { Ok = false; Text = $"The daemon response was lost: {error.Message}. The outcome is unknown; do not resend automatically." }
+        }
+
     /// Forward one call and return what the daemon said, verbatim.
-    let call (verb: string) (input: JsonNode) : Async<Answer> =
+    let call (verb: string) (input: JsonNode) (metadata: JsonNode option) : Async<Answer> =
         async {
             match! obtain startupTimeout with
             | None ->
-                return
-                    { Ok = false
-                      Text = $"the collaboration daemon could not be started; see {Paths.log ()}" }
+                return { Ok = false; Text = $"the collaboration daemon could not be started; see {Paths.log ()}" }
             | Some socket ->
-                try
-                    use stream = new NetworkStream(socket, true)
-                    use writer = new StreamWriter(stream, AutoFlush = true)
-                    use reader = new StreamReader(stream)
-
-                    do!
-                        writer.WriteLineAsync(Protocol.encodeCall { Verb = verb; Input = input })
-                        |> Async.AwaitTask
-
-                    let! line = reader.ReadLineAsync() |> Async.AwaitTask
-
-                    match (if isNull line then None else Protocol.decodeAnswer line) with
-                    | Some answer -> return answer
-                    | None ->
-                        return
-                            { Ok = false
-                              Text = "the collaboration daemon closed the connection without answering" }
-                with error ->
-                    return
-                        { Ok = false
-                          Text = $"could not talk to the collaboration daemon: {error.Message}" }
+                return! exchange socket { Verb = verb; Input = input; Metadata = metadata } (TimeSpan.FromSeconds 60.)
         }
+
+    /// Inspect an existing daemon without starting one or entering attribution.
+    let status () : Async<Answer> = async {
+        match tryConnect () with
+        | None -> return { Ok = false; Text = "No collaboration daemon is reachable." }
+        | Some socket ->
+            return! exchange socket { Verb = "_status"; Input = JsonObject(); Metadata = None } (TimeSpan.FromSeconds 5.)
+    }

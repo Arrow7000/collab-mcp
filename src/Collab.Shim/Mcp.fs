@@ -36,7 +36,7 @@ module Mcp =
 [
   {
     "name": "hello",
-    "description": "Announce the name you wish to be known by in this project. Call it once, before anything else. You supply only a name: which session you are, and which project you are working in, are taken from your runtime rather than from you.",
+    "description": "Choose an explicit peer name before exchanging messages, if you want one. OC2 sessions with collab loaded are registered automatically with a stable generated name; hello is optional. A name owned by another session is refused; choose a different name. Repeating your name is harmless. An unused generated name can be replaced once; names cannot change after messages start. You supply only a name: which session you are, and which project you are working in, are taken from your runtime rather than from you.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -121,6 +121,7 @@ module Mcp =
 
         payload["capabilities"] <- capabilities
         payload["serverInfo"] <- server
+        payload["instructions"] <- JsonValue.Create "OC2 sessions with collab loaded are automatically registered with a stable peer name. You do not need hello before roster or send. Roster identifies your own name and other project peers. Hello is optional to choose an explicit name before exchanging messages. Peer messages arrive automatically; end your turn when waiting for a reply and never poll."
         payload :> JsonNode
 
     let private listTools () : JsonNode =
@@ -147,7 +148,15 @@ module Mcp =
                         | value -> value.DeepClone()
                     | _ -> JsonObject() :> JsonNode
 
-                let! answer = Client.call verb arguments
+                let metadata =
+                    match parameters with
+                    | Some(:? JsonObject as object') ->
+                        match object'["_meta"] with
+                        | null -> None
+                        | value -> Some(value.DeepClone())
+                    | _ -> None
+
+                let! answer = Client.call verb arguments metadata
                 return asToolResult answer
         }
 

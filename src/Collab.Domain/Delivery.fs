@@ -10,12 +10,18 @@ open System
 
 /// Refusals the router decides, before any harness is involved.
 ///
-/// Only one for now. The rate limits, duplicate suppression and interrupt budgets in
+/// The rate limits, duplicate suppression and interrupt budgets in
 /// DESIGN.md §8 are real requirements, but there is no traffic to protect until this
 /// works end to end, and adding cases here later disturbs nothing.
 type Refusal =
     /// Addressing yourself. Almost always a model error; refusing surfaces it.
     | SelfAddressed of AgentName
+    | MessageTooLarge of bytes: int * max: int
+    | QueueFull of detail: string
+    /// Another live session already owns this name in the project.
+    | NameInUse of AgentName
+    /// A session has one name; a later hello cannot silently change its sender identity.
+    | AlreadyNamed of current: AgentName * requested: AgentName
 
 /// Failures the harness reports. Distinct from `Refusal`: these are things that went
 /// wrong, not rules we enforced.
@@ -23,6 +29,15 @@ type DeliveryFault =
     | SessionGone of Endpoint
     | HarnessUnreachable of detail: string
     | HarnessRejected of status: int * detail: string
+    /// A request may have been admitted, but its response was lost. Never retry blindly.
+    | AdmissionUnknown of detail: string
+
+/// Delivery IO reports back to the owner of the outbox.
+type DeliveryResult =
+    | Admitted
+    | NotAdmitted of DeliveryFault
+    /// A prior item in a backlog failed, so this item was never submitted.
+    | Deferred
 
 /// The outcome of one `send`.
 type DeliveryOutcome =

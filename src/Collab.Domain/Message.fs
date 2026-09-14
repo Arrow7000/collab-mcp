@@ -41,6 +41,15 @@ type SendRequest =
 
 module Envelope =
 
+    /// A runtime notice retains the sender's mailbox without inventing a peer identity.
+    let notice (now: DateTimeOffset) (text: string) (envelope: Envelope) : Envelope =
+        { envelope with
+            Id = MessageId(Guid.NewGuid())
+            To = envelope.From
+            Body = text
+            Urgency = AtTurnBoundary
+            SentAt = now }
+
     /// The only way to make an Envelope: `From` comes from the binding the router
     /// resolved, never from anything the sender claimed.
     let seal (from: AgentName) (now: DateTimeOffset) (request: SendRequest) : Envelope =

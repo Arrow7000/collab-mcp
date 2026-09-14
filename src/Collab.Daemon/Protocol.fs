@@ -19,8 +19,11 @@ type Call =
       /// The arguments exactly as they arrived. Kept whole rather than parsed into
       /// fields, because this is also the correlation key: the same object appears on
       /// the harness's event bus beside the session that sent it, and matching the two
-      /// is the only way a caller-blind MCP call can be attributed (DESIGN.md §7).
-      Input: JsonNode }
+      /// scopes calls to projects. Newer harness metadata also disambiguates sessions
+      /// (DESIGN.md §7).
+      Input: JsonNode
+      /// Harness-supplied MCP metadata, kept separate from model-visible arguments.
+      Metadata: JsonNode option }
 
 /// What the agent is told.
 type Answer = { Ok: bool; Text: string }
@@ -65,6 +68,7 @@ module Protocol =
         let body = JsonObject()
         body["verb"] <- JsonValue.Create call.Verb
         body["input"] <- call.Input.DeepClone()
+        call.Metadata |> Option.iter (fun metadata -> body["metadata"] <- metadata.DeepClone())
         body.ToJsonString()
 
     let decodeCall (line: string) : Call option =
@@ -83,7 +87,15 @@ module Protocol =
                             | value -> value.DeepClone()
                         | _ -> JsonObject() :> JsonNode
 
-                    Some { Verb = verb; Input = input }
+                    let metadata =
+                        match root with
+                        | :? JsonObject as object' ->
+                            match object'["metadata"] with
+                            | null -> None
+                            | value -> Some(value.DeepClone())
+                        | _ -> None
+
+                    Some { Verb = verb; Input = input; Metadata = metadata }
         with _ ->
             None
 

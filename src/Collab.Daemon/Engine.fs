@@ -24,23 +24,60 @@ type RosterView =
       Caller: Registration option }
 
 type private Message =
-    | MClaim of AgentName * Endpoint * AsyncReplyChannel<Intent list>
-    | MSend of Endpoint * SendRequest * AsyncReplyChannel<SendResult>
+    | MAnnounce of Endpoint * AsyncReplyChannel<Result<Intent list, exn>>
+    | MClaim of AgentName * Endpoint * AsyncReplyChannel<Result<Intent list, exn>>
+    | MSend of Endpoint * SendRequest * AsyncReplyChannel<Result<SendResult, exn>>
     | MRoster of Endpoint * AsyncReplyChannel<RosterView>
-    | MObserved of HarnessEvent * AsyncReplyChannel<Intent list>
-    | MExpire of AsyncReplyChannel<Intent list>
+    | MObserved of HarnessEvent * AsyncReplyChannel<Result<Intent list, exn>>
+    | MExpire of AsyncReplyChannel<Result<Intent list, exn>>
+    | MCompleted of Endpoint * Envelope * DeliveryResult * AsyncReplyChannel<Result<unit, exn>>
+    | MReconciled of Endpoint * Envelope * AsyncReplyChannel<Result<unit, exn>>
+    | MSnapshot of AsyncReplyChannel<RouterState>
 
-type Engine(clock: Clock, limits: Limits) =
+type Engine(clock: Clock, limits: Limits, ?store: StateStore) =
+
+    let commit action oldState nextState =
+        try
+            if oldState <> nextState then
+                store |> Option.iter (fun s -> s.Save(nextState, clock.Now(), action))
+            Ok nextState
+        with error -> Error error
+
+    let initial =
+        let loaded = store |> Option.map (fun s -> s.Load()) |> Option.defaultValue RouterState.empty
+        let recovered =
+            let pending =
+                loaded.Pending |> List.map (fun mail ->
+                    match mail.Status with
+                    | Delivering endpoint ->
+                        { mail with Status = Uncertain(endpoint, "Daemon restarted during admission; delivery outcome is unknown.") }
+                    | _ -> mail)
+            { loaded with Pending = pending }
+        match commit "restart recovery" loaded recovered with
+        | Ok state -> state
+        | Error error -> raise error
+
+    let unwrap operation = async {
+        let! result = operation
+        return result |> Result.defaultWith raise
+    }
 
     let agent =
         MailboxProcessor<Message>.Start(fun inbox ->
             let rec loop (state: RouterState) =
                 async {
                     match! inbox.Receive() with
+                    | MAnnounce(endpoint, reply) ->
+                        let next, intents = Router.announce (clock.Now()) endpoint state
+                        match commit "automatic registration" state next with
+                        | Ok saved -> reply.Reply(Ok intents); return! loop saved
+                        | Error error -> reply.Reply(Error error); return! loop state
+
                     | MClaim(name, endpoint, reply) ->
                         let state', intents = Router.claim (clock.Now()) name endpoint state
-                        reply.Reply intents
-                        return! loop state'
+                        match commit "router transition" state state' with
+                        | Ok saved -> reply.Reply(Ok intents); return! loop saved
+                        | Error error -> reply.Reply(Error error); return! loop state
 
                     | MSend(endpoint, request, reply) ->
                         // The sender is looked up, never taken from the request: the
@@ -48,14 +85,15 @@ type Engine(clock: Clock, limits: Limits) =
                         // name that session answers to (DESIGN.md §7).
                         match RouterState.boundTo endpoint state with
                         | None ->
-                            reply.Reply Anonymous
+                            reply.Reply(Ok Anonymous)
                             return! loop state
                         | Some caller ->
                             let state', intents =
                                 Router.send (clock.Now()) limits caller.Scope caller.Name request state
 
-                            reply.Reply(Decided intents)
-                            return! loop state'
+                            match commit "send accepted" state state' with
+                            | Ok saved -> reply.Reply(Ok(Decided intents)); return! loop saved
+                            | Error error -> reply.Reply(Error error); return! loop state
 
                     | MRoster(endpoint, reply) ->
                         reply.Reply
@@ -66,28 +104,57 @@ type Engine(clock: Clock, limits: Limits) =
 
                     | MObserved(event, reply) ->
                         let state', intents = Router.observe event state
-                        reply.Reply intents
-                        return! loop state'
+                        match commit "router transition" state state' with
+                        | Ok saved -> reply.Reply(Ok intents); return! loop saved
+                        | Error error -> reply.Reply(Error error); return! loop state
 
                     | MExpire reply ->
                         let state', intents = Router.expire (clock.Now()) state
-                        reply.Reply intents
-                        return! loop state'
+                        match commit "router transition" state state' with
+                        | Ok saved -> reply.Reply(Ok intents); return! loop saved
+                        | Error error -> reply.Reply(Error error); return! loop state
+
+                    | MCompleted(endpoint, envelope, result, reply) ->
+                        let state' = Router.completed (clock.Now()) endpoint envelope result state
+                        match commit "delivery result" state state' with
+                        | Ok saved -> reply.Reply(Ok()); return! loop saved
+                        | Error error -> reply.Reply(Error error); return! loop state
+
+                    | MReconciled(endpoint, envelope, reply) ->
+                        let next = Router.reconciled endpoint envelope state
+                        match commit "admission reconciled" state next with
+                        | Ok saved -> reply.Reply(Ok()); return! loop saved
+                        | Error error -> reply.Reply(Error error); return! loop state
+
+                    | MSnapshot reply ->
+                        reply.Reply state
+                        return! loop state
                 }
 
-            loop RouterState.empty)
+            loop initial)
 
     member _.Claim(name: AgentName, endpoint: Endpoint) : Async<Intent list> =
-        agent.PostAndAsyncReply(fun reply -> MClaim(name, endpoint, reply))
+        agent.PostAndAsyncReply(fun reply -> MClaim(name, endpoint, reply)) |> unwrap
 
     member _.Send(endpoint: Endpoint, request: SendRequest) : Async<SendResult> =
-        agent.PostAndAsyncReply(fun reply -> MSend(endpoint, request, reply))
+        agent.PostAndAsyncReply(fun reply -> MSend(endpoint, request, reply)) |> unwrap
 
     member _.Roster(endpoint: Endpoint) : Async<RosterView> =
         agent.PostAndAsyncReply(fun reply -> MRoster(endpoint, reply))
 
     member _.Observed(event: HarnessEvent) : Async<Intent list> =
-        agent.PostAndAsyncReply(fun reply -> MObserved(event, reply))
+        agent.PostAndAsyncReply(fun reply -> MObserved(event, reply)) |> unwrap
 
     member _.Expire() : Async<Intent list> =
-        agent.PostAndAsyncReply MExpire
+        agent.PostAndAsyncReply MExpire |> unwrap
+
+    member _.Completed(endpoint: Endpoint, envelope: Envelope, result: DeliveryResult) : Async<unit> =
+        agent.PostAndAsyncReply(fun reply -> MCompleted(endpoint, envelope, result, reply)) |> unwrap
+
+    member _.Snapshot() : Async<RouterState> = agent.PostAndAsyncReply MSnapshot
+
+    member _.Reconciled(endpoint: Endpoint, envelope: Envelope) : Async<unit> =
+        agent.PostAndAsyncReply(fun reply -> MReconciled(endpoint, envelope, reply)) |> unwrap
+
+    member _.Announce(endpoint: Endpoint) : Async<Intent list> =
+        agent.PostAndAsyncReply(fun reply -> MAnnounce(endpoint, reply)) |> unwrap

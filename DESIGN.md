@@ -3,6 +3,7 @@
 Peer-to-peer collaboration for coding agents across providers, with **push delivery**.
 
 Status: P1 built and demonstrated end to end. Phases are at the bottom.
+Current milestones and acceptance checks are tracked in §10 below.
 
 ---
 
@@ -181,12 +182,16 @@ would duplicate the runtime and get it subtly wrong, so `HarnessEvent` carries n
 
 ## 7. Identity and attribution
 
-**Agents name themselves.** An agent announces its name with `hello`; there is no
-allocation step and nothing to create before a run. An earlier design had the router
-mint names so that an unknown recipient could be rejected outright rather than parked,
-but that bought only immediate typo feedback — which `ReturnToSender` already gives —
-and protection against name-squatting, which is not a threat model for agents that are
-all the same user's, on one machine. It was complexity without a payer.
+**Automatic presence, optional explicit naming.** OC2 sessions are registered when the
+harness reports session creation, viewing, or execution and the project's `collab` MCP
+server is connected. The default peer name is `oc2-` plus a stable session-derived hash.
+This does not enumerate historical conversations, execute model work, or wake an idle
+session. A scoped `roster`/`send` call also repairs a missed lifecycle registration.
+
+`hello` is optional: it can replace an unused generated name with an explicit name.
+Once any peer message is accepted from or to that identity, the default name is fixed;
+this avoids stranding accepted mail or changing an identity peers already used.
+Existing explicit names are preserved. Invalid or colliding requested names are refused.
 
 The cost is that the router cannot distinguish "still booting" from "misaddressed" at
 send time, so it must assume the former and park under a deadline. Peers spawned
@@ -194,6 +199,14 @@ together genuinely do race, and refusing there is what forces retry loops.
 
 Names are **never rewritten**. An invalid or colliding name is an error, not a silent
 substitution.
+
+**Ownership.** One live endpoint owns one name, and one name has one live owner in its
+project. Repeating `hello` with an equivalent name preserves the original spelling and
+binding timestamps. A different name is refused after explicit naming or the first
+accepted exchange; only an unused provisional default can be replaced.
+A competing live session cannot replace the owner. Session deletion releases the
+binding, after which a restarted session can claim that mailbox and its waiting mail.
+Reconciliation of missing/deleted sessions remains required recovery work.
 
 **Nothing about an agent's identity or location is taken from the agent.** An agent
 supplies only the name it wishes to be known by, and who it is writing to. Which session
@@ -215,28 +228,32 @@ Binding `name → endpoint`:
 
 - **Claude Code**: read `CLAUDE_CODE_SESSION_ID` and `CLAUDE_PROJECT_DIR` from the
   shim's environment. Direct; no correlation needed.
-- **opencode**: the agent announces its name; the router matches the
+- **opencode**: lifecycle observations announce connected sessions automatically. For
+  tool calls, the router matches the
   `session.tool.progress` event carrying that call and binds the emitting `sessionID`.
   Correlation happens on *every* call, not only at bind time, because `send` and `roster`
   need the caller's identity just as much as `hello` does — that is what lets `send` take
-  no `from`. The mapping itself is durable and re-bindable when a session restarts.
+  no `from`. The mapping is persisted with the outbox in SQLite. An unbound
+  mailbox can be reclaimed when a session restarts.
 
-  The correlation key is the tool name and its arguments, and nothing else: everything
-  else about a call is what we are trying to learn. Two calls alike in both are therefore
-  indistinguishable, which is a real if narrow limit — two agents in *different* projects
-  calling `roster()` in the same instant could in principle be answered for each other.
-  Matching is oldest-first. The alternative is to ask the agent for something, which is
-  the thing this design exists to avoid.
+  Runtime session metadata is mandatory. The shim forwards `_meta` separately from
+  arguments; the daemon requires `ai.opencode/sessionID` (source) or `sessionID` (docs),
+  refuses conflicting/malformed/missing context, and joins only facts from that session.
+  Scope still comes from the event. Only `collab` server progress is eligible. The
+  installed beta lacks metadata and is unsupported; argument-only matching was removed
+  following the user's compatibility decision. OC2 2.0.3 was verified through the real
+  shim and durable daemon in isolated Code Mode with a local scripted provider.
+  Direct mode now joins its scoped name/input events and was also verified end to end. Evidence is in [docs/findings-attribution.md](docs/findings-attribution.md).
 
 Identities outlive sessions. A name is a mailbox, not a process.
 
 ## 8. Safety
 
-**Deferred to P2, deliberately.** The rules below are real requirements, but there is no
-traffic to protect until the thing works end to end, and every one of them can be added
-without disturbing delivery. The first version ships with a single refusal
-(`SelfAddressed`) and a single limit (the park deadline). Building the safety machinery
-first was the main way this design was over-engineered.
+P1 initially shipped with self-address refusal and a park deadline. Name ownership
+now refuses live collisions and renaming a bound session. Text is bounded to 16 KiB
+UTF-8, mailboxes to 64 peer items, and the outbox to 256 peers with reserved capacity
+for notices within 512 items. Admission capacity refusals never discard accepted mail.
+Rate limits, duplicate suppression and interrupt budgets remain requirements below.
 
 
 - **Loop breaking** — rate-limit per sender→recipient pair, drop identical repeats within
@@ -259,16 +276,133 @@ first was the main way this design was over-engineered.
   must reconcile via `GET /session/{id}/inbox` on reconnect rather than trust it saw
   every event.
 
-## 10. Phases
+## 10. Roadmap
 
-- **P1** — *done*. Domain types, router daemon (SSE + registry + `hello`/`roster`/`send`),
-  opencode adapter, both delivery classes, stdio shim.
-  Demo: two opencode agents on different providers, one idle, woken by the other, no
-  polling. Verified as a full round trip — each agent woken from idle by the other.
-- **P2** — durable parking for unbound names, reconnect/reconciliation, rate limits and
-  loop-breaking, audit log.
-- **P3** — Claude Code adapter (one namespace across harnesses), file leases,
-  permission-laundering guard.
+P1 demonstrated bidirectional idle wake-up between two OpenCode agents on different
+providers. The original P2 phase covered reliability and safety; P3 covered other
+harnesses and shared-edit coordination. The milestones below track that remaining
+work and its acceptance checks. Historical reviews live in `docs/` and are not current
+status reports.
+
+### Current target
+
+Two peers can send, stop, restart, and resume without accepted messages silently
+disappearing or identities changing. The open terminal shows the trigger and streams
+the resulting activity. Backend transcript checks alone are insufficient.
+
+### M1 — trustworthy identity and existing delivery
+
+- [x] Enforce one active name per endpoint and one active endpoint per name.
+  Repeating hello with the same name is idempotent and preserves displayed spelling;
+  requesting a different name is refused. Another live owner blocks a claim. An
+  unbound name can be reclaimed after session deletion.
+- [x] Add deterministic regression tests and include them in `dotnet test`.
+- [x] Inspect installed and current V2 MCP call paths for harness-supplied context.
+- [x] Forward session metadata independently of arguments and constrain event matching
+  by session when present; refuse malformed/conflicting metadata.
+- [x] Filter observations to the collab server and retain endpoint identity in dedupe keys.
+- [x] Require runtime session metadata and remove argument-only attribution.
+- [x] Automatically register newly created/viewed/executing OC2 sessions with connected
+  collab servers. Preserve explicit names; test two peers before any model/hello call.
+- [x] Demonstrate metadata-scoped attribution through the real shim/daemon in isolated
+  OC2 2.0.3 Code Mode, using a local scripted model provider.
+- [x] Support and verify the direct-tool event sequence (`codemode:false`).
+- [x] Keep ownership of backlog until delivery admission is acknowledged; report
+  failed flushes truthfully and release missing-session bindings.
+- [x] Apply park deadlines during claims, not just timer ticks.
+- [x] Fix discovery subprocess deadlines, socket disposal, and daemon response deadlines.
+- [x] Expose event-stream readiness/failures in logs and `--status`; bound SSE handshakes.
+  Early shim startup only establishes socket readiness. It cannot promise receipt of
+  the first attribution fact on metadata-less harnesses.
+- [x] Reject silent name rewriting, including surrounding whitespace.
+- [x] Normalize absolute filesystem scopes and trailing separators while preserving case.
+  Symlink aliases remain separate scopes.
+- [x] Correct README claims about attribution and component completeness.
+
+Done when regressions are covered, failure paths have explicit outcomes, and remaining
+attribution limitations are documented precisely. Do not claim identity safety while
+the required metadata/event path lacks runtime verification.
+
+### M2 — durable delivery and recovery
+
+- [x] Specify delivery state and transitions before storage bodies: pending, admitted,
+  retryable, expired, permanently failed, and ambiguous admission after response loss.
+- [x] Persist registry, outbox, and audit changes together in SQLite.
+- [x] Feed delivery acknowledgements into the engine; retain stable message IDs.
+- [ ] Complete session reconciliation and absent-input recovery after reconnect/restart.
+  Positive matching synthetic inbox/transcript evidence now clears uncertain mail.
+- [ ] Define ordering and idempotency using verified harness capabilities.
+- [ ] Complete version/restart workflow and reproducible installation. Read-only
+  `--status` now reports connection readiness, bindings, and outbox states.
+
+Done when daemon and harness restart tests preserve accepted mail, failed deliveries
+remain recoverable, and ambiguous admissions have a documented policy. No unsupported
+exactly-once promise.
+
+Current recovery policy: accepted mail is committed before intents or acknowledgements.
+Waiting mail remains retryable; acknowledged admissions leave the outbox. A lost
+response or a restart during delivery leaves an uncertain item that blocks its mailbox.
+It is never retried blindly. Synthetic input uses a stable `msg_` ID derived from the
+envelope UUID. Identical admissions were verified against installed OC2 with
+`resume:false`: the same item was returned twice and one inbox item remained. This
+checks queued idempotency; projected-message and cross-version retry guarantees remain
+open. Reconciliation accepts only positive, matching inbox/transcript evidence.
+SQLite commits the registry, outbox, and a full state audit snapshot in one transaction;
+unchanged state produces no audit row. Audit snapshots retain the last 64 transitions
+in the same transaction, bounding historical storage. The private database is `~/.collab-mcp/state.sqlite`
+(or the directory supplied by `COLLAB_MCP_HOME` for isolated runs).
+
+### M3 — bounded operation and visible behaviour
+
+- [x] Bound outbox/mailboxes, message sizes, and audit snapshot retention.
+- [ ] Limit sender/recipient traffic and interrupts.
+- [ ] Suppress duplicate messages and prevent reply loops.
+- [ ] Define activity-aware roster cleanup without confusing idle with dead.
+- [x] Add fake HTTP/SSE integration tests, an optional real OC2 check script, and Linux/macOS CI checks.
+  CI configuration is added to the working tree; hosted execution is unverified.
+- [x] Verify a real OC2 2.0.3 TUI displays idle/busy queue triggers and streams replies
+  without user prompts, using a scripted local provider. Busy mail does not overtake.
+- [ ] Complete visual/tool/permission/steer and return-to-idle checks beyond terminal
+  text assertions. Reproduce the current check with `scripts/check-oc2.py`.
+- [ ] Check typing, scroll position, background tabs, and detach/reconnect separately.
+
+Done when unattended collaboration has bounded resource use and the user can observe
+externally triggered work in the same open session.
+
+### M4 — cross-harness collaboration
+
+- [ ] Verify Claude Code's channel transport against its installed version, including
+  opt-in, receipt semantics, terminal visibility, and unsupported interrupt behaviour.
+- [ ] Verify Codex's shared app-server/thread transport, external-input rendering,
+  attribution, and peer provenance. Do not assume a synthetic message type exists.
+- [ ] Implement adapters behind the harness boundary.
+- [ ] Demonstrate bidirectional idle wake-up across harnesses with real TUIs open.
+
+Done when cross-harness peers share a namespace and exhibit the same supported
+delivery contract; unsupported urgency must be explicit.
+
+### M5 — coordination of shared edits
+
+- [ ] Specify file lease ownership, expiry, renewal, and conflict behaviour.
+- [ ] Decide whether leases are advisory or enforced by harness/tool integration.
+- [ ] Define an enforceable permission-isolation policy for opaque peer messages.
+- [ ] Demonstrate two peers coordinating shared edits and recovering from a dead owner.
+
+### Evidence
+
+- 2026-09-14: session metadata forwarding, session-constrained event matching, server
+  filtering, and endpoint-scoped dedupe implemented. All 40 regression cases pass;
+  Release builds with zero warnings/errors. Newer harness runtime verification remains.
+- 2026-09-14: name ownership implemented; routing and engine regression tests added.
+  Live owners block competing claims, repeat hello preserves identity, deletion permits
+  reclaim, and legacy aliases are released together. Attribution remains unresolved.
+- [Initial review](docs/review-2026-09-14.md)
+- [Original OC2 runtime findings](docs/findings-oc2.md)
+- [TUI visibility investigation](docs/findings-tui.md)
+- [Attribution investigation](docs/findings-attribution.md)
+
+Update checkboxes only after implementation and relevant checks pass. Keep unresolved
+harness questions here instead of treating API acceptance as end-to-end proof.
 
 ## 11. Working agreement
 

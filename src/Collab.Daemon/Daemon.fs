@@ -57,10 +57,16 @@ module Daemon =
         | SessionGone _ -> "its session has gone"
         | HarnessUnreachable detail -> $"its runtime is unreachable ({detail})"
         | HarnessRejected(status, detail) -> $"its runtime refused the message with status {status}: {detail}"
+        | Collab.Domain.AdmissionUnknown detail -> $"admission is uncertain ({detail}); it may already have arrived — do not resend"
 
     let private describeRefusal (refusal: Refusal) =
         match refusal with
+        | MessageTooLarge(bytes, max) -> $"the message is {bytes} UTF-8 bytes; the maximum is {max}"
+        | QueueFull detail -> $"{detail}; this message was not accepted"
         | SelfAddressed name -> $"you addressed yourself ({AgentName.value name})"
+        | NameInUse name -> $"the name '{AgentName.value name}' is already owned by another session in this project; choose a different name"
+        | AlreadyNamed(current, requested) ->
+            $"you are already known as '{AgentName.value current}'; hello cannot change your name to '{AgentName.value requested}'"
 
     let private urgencyOf (input: JsonNode) =
         match Field.text "urgency" input with
@@ -100,7 +106,7 @@ module Daemon =
             let hint =
                 match view.Caller with
                 | Some _ -> ""
-                | None -> "\n\nYou have not announced a name yet; call hello before sending."
+                | None -> "\n\nAutomatic registration is unavailable; report this rather than polling."
 
             $"Agents in {directory}:\n{listing}{hint}"
 
@@ -117,89 +123,113 @@ module Daemon =
             // call is answered at once rather than after the attribution wait.
             let invocation = { Tool = call.Verb; Input = call.Input.ToJsonString() }
 
-            let resolve () = attribution.Resolve(invocation, attributionTimeout)
+            let context = Mapping.sessionMetadata call.Metadata
+            let resolve () =
+                match context with
+                | Ok session -> async {
+                    let! endpoint = attribution.Resolve(invocation, attributionTimeout, session = session)
+                    match endpoint with
+                    | Some endpoint when call.Verb <> Verbs.Hello ->
+                        let! intents = engine.Announce endpoint
+                        let! _ = Perform.all ports clock engine intents
+                        return Some endpoint
+                    | _ -> return endpoint
+                  }
+                | Error error ->
+                    Log.write $"invalid caller metadata: {error}"
+                    async { return None }
 
             // Nothing has been performed at this point, so a repeat cannot duplicate
             // anything — and the usual cause is a daemon that had not finished
             // subscribing to the harness, which a second attempt a moment later gets
             // past. Saying so is better than a refusal the agent cannot act on.
             let unattributed =
-                no
-                    "Could not work out which session this call came from, so nothing was done — nothing was sent and nothing changed. Call this once more; if it fails again, report it rather than continuing to retry."
+                match context with
+                | Error error -> no $"Invalid runtime session metadata: {error}. Nothing was done; report this rather than retrying."
+                | Ok _ ->
+                    no
+                        "Could not work out which session this call came from, so nothing was done — nothing was sent and nothing changed. Call this once more; if it fails again, report it rather than continuing to retry."
 
-            match call.Verb with
-            | Verbs.Hello ->
-                match Field.text "name" call.Input with
-                | None -> return no "hello needs a name."
-                | Some raw ->
-                    match AgentName.create raw with
-                    | Error error -> return no $"'{raw}' cannot be used as a name: {describeName error}."
-                    | Ok name ->
-                        match! resolve () with
-                        | None -> return unattributed
-                        | Some endpoint ->
-                            let! intents = engine.Claim(name, endpoint)
-                            let! _ = Perform.all ports clock intents
-
-                            let waiting =
-                                intents
-                                |> List.sumBy (function
-                                    | Flush(_, envelopes) -> List.length envelopes
-                                    | _ -> 0)
-
-                            let backlog =
-                                if waiting = 0 then
-                                    ""
-                                else
-                                    $" {waiting} message(s) were already waiting for you and have just been delivered."
-
-                            return
-                                ok
-                                    $"You are known as {AgentName.value name} in {directoryOf endpoint}. Peers can now reach you, and their messages arrive on their own — there is nothing to check.{backlog}"
-
-            | Verbs.Roster ->
-                match! resolve () with
-                | None -> return unattributed
-                | Some endpoint ->
-                    let! view = engine.Roster endpoint
-                    return ok (describeRoster endpoint view)
-
-            | Verbs.Send ->
-                match Field.text "to" call.Input, Field.text "body" call.Input with
-                | None, _ -> return no "send needs a recipient in 'to'."
-                | _, None -> return no "send needs a message in 'body'."
-                | Some rawTo, Some body ->
-                    match AgentName.create rawTo with
-                    | Error error -> return no $"'{rawTo}' cannot be used as a name: {describeName error}."
-                    | Ok recipient ->
-                        match! resolve () with
-                        | None -> return unattributed
-                        | Some endpoint ->
-                            let request =
-                                { To = recipient
-                                  Body = body
-                                  Urgency = urgencyOf call.Input }
-
-                            match! engine.Send(endpoint, request) with
-                            | Anonymous ->
-                                return
-                                    no
-                                        "You have not announced a name yet, so there is nobody to send this from. Call hello first."
-                            | Decided intents ->
-                                let! outcomes = Perform.all ports clock intents
-                                let name = AgentName.value recipient
+            match call.Verb, context with
+            | (Verbs.Hello | Verbs.Roster | Verbs.Send), Error _ -> return unattributed
+            | _, _ ->
+                match call.Verb with
+                | Verbs.Hello ->
+                    match Field.text "name" call.Input with
+                    | None -> return no "hello needs a name."
+                    | Some raw ->
+                        match AgentName.create raw with
+                        | Error error -> return no $"'{raw}' cannot be used as a name: {describeName error}."
+                        | Ok name ->
+                            match! resolve () with
+                            | None -> return unattributed
+                            | Some endpoint ->
+                                let! intents = engine.Claim(name, endpoint)
+                                let! outcomes = Perform.all ports clock engine intents
 
                                 match outcomes with
-                                | [ Delivered _ ] -> return ok $"Delivered to {name}. {endYourTurn}"
-                                | [ Parked _ ] ->
+                                | [ Refused refusal ] -> return no $"Name not claimed: {describeRefusal refusal}."
+                                | _ ->
+                                    let claimedName =
+                                        intents
+                                        |> List.pick (function
+                                            | CompleteClaim(claimed, _) -> Some claimed
+                                            | _ -> None)
+
+                                    let delivered = outcomes |> List.sumBy (function Delivered _ -> 1 | _ -> 0)
+                                    let held = outcomes |> List.sumBy (function Parked _ -> 1 | _ -> 0)
+                                    let failed = outcomes |> List.sumBy (function Failed _ -> 1 | _ -> 0)
+                                    let backlog =
+                                        if List.isEmpty outcomes then ""
+                                        else $" Backlog: {delivered} admitted, {held} still held, {failed} failed or uncertain."
+
                                     return
                                         ok
-                                            $"{name} has not announced itself yet, so your message is held and will be delivered the moment it does. Do not resend. {endYourTurn}"
-                                | [ Refused refusal ] -> return no $"Not sent: {describeRefusal refusal}."
-                                | [ Failed fault ] -> return no $"Could not reach {name}: {describeFault fault}."
-                                | _ -> return no "The router reached no decision, which is a bug."
+                                            $"You are known as {AgentName.value claimedName} in {directoryOf endpoint}. Peers can now reach you, and their messages arrive on their own — there is nothing to check.{backlog}"
 
-            | other -> return no $"unknown verb '{other}'"
+                | Verbs.Roster ->
+                    match! resolve () with
+                    | None -> return unattributed
+                    | Some endpoint ->
+                        let! view = engine.Roster endpoint
+                        return ok (describeRoster endpoint view)
+
+                | Verbs.Send ->
+                    match Field.text "to" call.Input, Field.text "body" call.Input with
+                    | None, _ -> return no "send needs a recipient in 'to'."
+                    | _, None -> return no "send needs a message in 'body'."
+                    | Some rawTo, Some body ->
+                        match AgentName.create rawTo with
+                        | Error error -> return no $"'{rawTo}' cannot be used as a name: {describeName error}."
+                        | Ok recipient ->
+                            match! resolve () with
+                            | None -> return unattributed
+                            | Some endpoint ->
+                                let request =
+                                    { To = recipient
+                                      Body = body
+                                      Urgency = urgencyOf call.Input }
+
+                                match! engine.Send(endpoint, request) with
+                                | Anonymous ->
+                                    return
+                                        no
+                                            "Automatic registration did not establish your identity. Nothing was sent; report this rather than retrying."
+                                | Decided intents ->
+                                    let! outcomes = Perform.all ports clock engine intents
+                                    let name = AgentName.value recipient
+
+                                    match outcomes with
+                                    | [ Delivered _ ] -> return ok $"Delivered to {name}. {endYourTurn}"
+                                    | [ Parked _ ] ->
+                                        return
+                                            ok
+                                                $"Your message to {name} is held for delivery. The router owns it and will retry known failures or report expiry. Do not resend. {endYourTurn}"
+                                    | [ Refused refusal ] -> return no $"Not sent: {describeRefusal refusal}."
+                                    | [ Failed fault ] -> return no $"Could not reach {name}: {describeFault fault}."
+                                    | _ -> return no "The router reached no decision, which is a bug."
+
+                | other -> return no $"unknown verb '{other}'"
         }
 
     let private handle (dispatch: Call -> Async<Answer>) (client: Socket) =
@@ -270,11 +300,14 @@ module Daemon =
             Log.write $"listening on {path}"
 
             let clock = SystemClock() :> Clock
-            let engine = Engine(clock, Limits.defaults)
+            use store = new SqliteStateStore(Paths.database())
+            let engine = Engine(clock, Limits.defaults, store = (store :> StateStore))
             let attribution = Attribution(factCapacity, factWindow, clock)
 
             use adapter = new OpenCodeAdapter()
             let port = adapter :> HarnessPort
+            use _connectionSubscription = adapter.Connections.Subscribe(Observer.onNext (fun status ->
+                Log.write $"opencode event stream: {status}"))
 
             let ports kind =
                 if kind = HarnessKind.OpenCode then Some port else None
@@ -285,26 +318,88 @@ module Daemon =
                  | SessionEnded _ -> ())
 
                 async {
-                    let! intents = engine.Observed event
-                    let! _ = Perform.all ports clock intents
-                    return ()
+                    try
+                        let! intents = engine.Observed event
+                        let! _ = Perform.all ports clock engine intents
+                        ()
+                    with error -> Log.write $"event handling failed: {error.Message}"
                 }
                 |> Async.Start
 
+            let announcing (endpoint: Endpoint) =
+                async {
+                    try
+                        let rec ready attempts = async {
+                            let! eligible = adapter.HasCollab endpoint
+                            match eligible with
+                            | Ok true -> return true
+                            | _ when attempts > 0 ->
+                                do! Async.Sleep 250
+                                return! ready (attempts - 1)
+                            | Error error -> Log.write $"automatic registration unavailable: {error}"; return false
+                            | _ -> return false
+                        }
+                        let! eligible = ready 12
+                        if eligible then
+                            let! intents = engine.Announce endpoint
+                            let! _ = Perform.all ports clock engine intents
+                            ()
+                    with error -> Log.write $"automatic registration failed: {error.Message}"
+                } |> Async.Start
+
+            use _sessionSubscription = adapter.Sessions.Subscribe(Observer.onNext announcing)
+
             use _subscription = port.Observe().Subscribe(Observer.onNext observed)
-            Log.write "subscribed to the opencode event stream"
+            Log.write "event stream subscription requested; connection readiness is reported separately"
 
             let rec expiring () =
                 async {
                     do! Async.Sleep expiryIntervalMs
-                    let! intents = engine.Expire()
-                    let! _ = Perform.all ports clock intents
+                    try
+                        let! intents = engine.Expire()
+                        let! _ = Perform.all ports clock engine intents
+                        ()
+                    with error -> Log.write $"outbox maintenance failed; will retry: {error.Message}"
                     return! expiring ()
                 }
 
             Async.Start(expiring ())
 
-            let serve = dispatch engine attribution ports clock
+            let rec reconciling () = async {
+                do! Async.Sleep 10000
+                try
+                    let! state = engine.Snapshot()
+                    for mail in state.Pending do
+                        match mail.Status with
+                        | Uncertain(endpoint, _) when endpoint.Harness = OpenCode ->
+                            let! evidence = adapter.FindAdmission(endpoint, mail.Envelope)
+                            match evidence with
+                            | Ok true ->
+                                do! engine.Reconciled(endpoint, mail.Envelope)
+                                Log.write $"reconciled admitted message {mail.Envelope.Id}"
+                            | Ok false -> ()
+                            | Error error -> Log.write $"admission reconciliation unavailable: {error}"
+                        | _ -> ()
+                with error -> Log.write $"admission reconciliation failed: {error.Message}"
+                return! reconciling ()
+            }
+            Async.Start(reconciling ())
+
+            let toolDispatch = dispatch engine attribution ports clock
+            let serve (call: Call) = async {
+                if call.Verb = "_status" then
+                    let! state = engine.Snapshot()
+                    let waiting, delivering, uncertain =
+                        state.Pending |> List.fold (fun (w, d, u) mail ->
+                            match mail.Status with
+                            | Waiting _ -> w + 1, d, u
+                            | Delivering _ -> w, d + 1, u
+                            | Uncertain _ -> w, d, u + 1) (0, 0, 0)
+                    let bound = state.Registrations |> Map.toSeq |> Seq.sumBy (fun (_, r) ->
+                        match r.Binding with Bound _ -> 1 | Unbound -> 0)
+                    return ok $"Daemon PID: {Environment.ProcessId}\nEvent stream: {adapter.Connection}\nRegistrations: {state.Registrations.Count} ({bound} bound)\nOutbox: {waiting} waiting, {delivering} delivering, {uncertain} uncertain\nDatabase: {Paths.database()}\nAttribution: runtime session metadata required; argument-only matching disabled."
+                else return! toolDispatch call
+            }
 
             let rec accepting () =
                 async {
