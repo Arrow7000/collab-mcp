@@ -191,3 +191,11 @@ let ``session lifecycle observations require real project context`` kind =
     equal (Some a) (Mapping.sessionAvailable frame)
     equal None (Mapping.sessionAvailable { frame with Directory = None })
     equal None (Mapping.sessionAvailable { frame with Directory = Some "relative" })
+
+[<Fact>]
+let ``authenticated deletion without directory identifies a session but never a caller`` () =
+    let frame = { directFrame EventTypes.SessionDeleted "a" "/project" with Directory = None }
+    equal [ SessionDeleted(SessionId "a") ] (Mapping.observe frame)
+    equal None (Mapping.sessionAvailable frame)
+    frame.Data["sessionID"] <- JsonValue.Create " "
+    equal [] (Mapping.observe frame)

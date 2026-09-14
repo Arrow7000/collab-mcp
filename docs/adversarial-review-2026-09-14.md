@@ -134,3 +134,33 @@ request completes while a tool waits, plus response framing/concurrency checks.
 Recommended next order: lifecycle ordering and deletion safety, then bounded shim
 concurrency. Re-run the two-agent integration check and adversarial regressions after
 these changes. Known roadmap omissions remain separate from these findings.
+
+## Sol findings resolution
+
+Both Sol findings are fixed in the subsequent implementation:
+
+- Definitive deletion records a persistent harness/session tombstone in version-5
+  state. The engine checks it atomically during automatic registration and explicit
+  naming. Late eligibility results cannot recreate a bound registration, including
+  after daemon restart. Confirmed SessionGone delivery results apply the same guard.
+- OC2 2.0.3's real deletion event has no location. The adapter now forwards that
+  authenticated session deletion globally across its locations; creation and tool
+  attribution continue to require real project context. This format was exposed by
+  expanding the real integration check with rapid create/delete sessions.
+- The shared shim forwards up to 32 tools concurrently and rejects excess work
+  before forwarding. Control requests remain responsive. Complete JSON responses
+  are serialized, preserve request IDs, and drain after input EOF. Tool exceptions
+  receive an error response rather than silently losing an answer.
+
+The original isolated reproductions now show ping available while the tool is held
+and no binding after a delayed announcement for a deleted session. Automated
+regressions cover both eligibility/deletion orderings, deletion persistence and
+scope changes, current unscoped deletion mapping, overload rejection, concurrent
+response framing, exception handling, and EOF drainage.
+
+Validation: all 132 Release tests pass; Debug builds without warnings or errors.
+Real OC2 checks pass for bidirectional identity-based delivery, rapid create/delete
+with persistent tombstones, direct tools, and idle/busy TUI notices and streaming.
+The live version-5 migration and shared MCP refresh preserved all five existing
+identities, names, and bindings. The two-agent tests use an isolated scripted local
+provider rather than paid or autonomous-model calls.

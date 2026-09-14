@@ -86,7 +86,7 @@ let ``failed persistence rejects acknowledgement and leaves the engine responsiv
 
 [<Fact>]
 let ``unsupported state versions fail explicitly`` () =
-    Assert.ThrowsAny<Exception>(fun () -> StateWire.decode "{\"version\":5}" |> ignore) |> ignore
+    Assert.ThrowsAny<Exception>(fun () -> StateWire.decode "{\"version\":6}" |> ignore) |> ignore
 
 [<Fact>]
 let ``positive admission reconciliation is durable and matches the endpoint`` () = withDatabase (fun path ->
@@ -172,7 +172,7 @@ let ``sqlite atomically upgrades a legacy snapshot and persists assigned IDs`` (
     use command = connection.CreateCommand()
     command.CommandText <- "SELECT payload FROM state WHERE id=1"
     let root = System.Text.Json.Nodes.JsonNode.Parse(command.ExecuteScalar() :?> string)
-    equal 4 (root["version"].GetValue<int>()))
+    equal 5 (root["version"].GetValue<int>()))
 
 [<Fact>]
 let ``renamed identity and aliases survive engine restart`` () = withDatabase (fun path ->
@@ -335,7 +335,7 @@ let ``legacy hex name migration persists and engine sender identity survives res
     use command = connection.CreateCommand()
     command.CommandText <- "SELECT payload FROM state WHERE id=1"
     let root = System.Text.Json.Nodes.JsonNode.Parse(string (command.ExecuteScalar()))
-    equal 4 (root["version"].GetValue<int>()))
+    equal 5 (root["version"].GetValue<int>()))
 
 [<Fact>]
 let ``ambiguous legacy migration leaves database payload and audit unchanged`` () = withDatabase (fun path ->
@@ -370,3 +370,65 @@ let ``legacy prefixed hex alias reserves its normalized ID during allocation`` (
     let recipient = (RouterState.boundTo b state).Value
     Assert.NotEqual<string>("12345678", recipient.ShortId)
     equal (Some sender) (RouterState.lookup a.Scope (name "peer-12345678") state)
+
+[<Theory>]
+[<InlineData(false)>]
+[<InlineData(true)>]
+let ``delayed eligibility completing after deletion cannot register the endpoint`` previouslyRegistered =
+    let engine = Engine(clock, Limits.defaults)
+    if previouslyRegistered then run (engine.Announce a) |> ignore
+    let eligible = System.Threading.Tasks.TaskCompletionSource<bool>(System.Threading.Tasks.TaskCreationOptions.RunContinuationsAsynchronously)
+    let delayed = async {
+        let! ready = eligible.Task |> Async.AwaitTask
+        if ready then return! engine.Announce a
+        else return []
+    }
+    let delayedTask = Async.StartAsTask delayed
+    run (engine.Observed(SessionEnded a)) |> ignore
+    eligible.SetResult true
+    equal [] (delayedTask.GetAwaiter().GetResult())
+    let state = run (engine.Snapshot())
+    equal None (RouterState.boundTo a state)
+    equal (if previouslyRegistered then 1 else 0) state.Registrations.Count
+    Assert.True(RouterState.hasEnded a state)
+    equal [ Decline(EndedSession a) ] (run (engine.Claim(name "Phoenix", a)))
+
+[<Fact>]
+let ``deletion before registration persists across restart without poisoning other endpoints`` () = withDatabase (fun path ->
+    use storage = new SqliteStateStore(path)
+    let engine = Engine(clock, Limits.defaults, store = storage)
+    run (engine.Observed(SessionEnded a)) |> ignore
+    let restart = Engine(clock, Limits.defaults, store = storage)
+    equal [] (run (restart.Announce a))
+    let sameScopeSyntax = { a with Scope = Scope "/project/" }
+    equal [] (run (restart.Announce sameScopeSyntax))
+    equal [] (run (restart.Announce { a with Scope = Scope "/other" }))
+    for other in [ b; { a with Harness = ClaudeCode } ] do
+        Assert.NotEmpty(run (restart.Announce other))
+    let state = run (restart.Snapshot())
+    equal None (RouterState.boundTo a state)
+    equal 2 state.Registrations.Count)
+
+[<Fact>]
+let ``confirmed missing session also blocks late registration`` () =
+    let state = Router.claim now (name "Red") a RouterState.empty |> fst |> Router.claim now (name "Blue") b |> fst
+    let sent, _ = Router.send now Limits.defaults a.Scope (name "Red") { To = name "Blue"; Body = "gone"; Urgency = AtTurnBoundary } state
+    let released = Router.completed now b sent.Pending.Head.Envelope (NotAdmitted(SessionGone b)) sent
+    Assert.True(RouterState.hasEnded b released)
+    equal (released, []) (Router.announce now b released)
+    let newSession = { b with Session = SessionId "new-blue" }
+    let rebound, _ = Router.claim now (name "Blue") newSession released
+    Assert.True((RouterState.boundTo newSession rebound).IsSome)
+    equal (Some (RouterState.boundTo b state).Value.Id) rebound.Pending.Head.Envelope.ToPeer
+
+[<Fact>]
+let ``unscoped deletion ends all locations for that harness session`` () =
+    let engine = Engine(clock, Limits.defaults)
+    let moved = { a with Scope = Scope "/moved-project" }
+    run (engine.Announce a) |> ignore
+    run (engine.Announce moved) |> ignore
+    run (engine.Observed(SessionRemoved(OpenCode, a.Session))) |> ignore
+    equal [] (run (engine.Announce a))
+    equal [] (run (engine.Announce moved))
+    let state = run (engine.Snapshot())
+    Assert.True(state.Registrations |> Map.forall (fun _ r -> not (Binding.isLive r.Binding)))

@@ -35,6 +35,8 @@ type HarnessEvent =
     /// The session no longer exists. Its binding must be dropped and anything
     /// undelivered re-parked.
     | SessionEnded of endpoint: Endpoint
+    /// Authenticated harness-wide deletion can arrive without project context.
+    | SessionRemoved of harness: HarnessKind * session: SessionId
 
 /// One agent runtime we can observe and deliver into.
 ///

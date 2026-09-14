@@ -30,7 +30,8 @@ type PendingMail =
 
 type RouterState =
     { Registrations: Map<string, Registration>
-      Pending: PendingMail list }
+      Pending: PendingMail list
+      Ended: Set<HarnessKind * SessionId> }
 
 type Limits =
     { ParkWindow: TimeSpan
@@ -54,7 +55,9 @@ module Limits =
 
 module RouterState =
     let private sep = string (char 0x1F)
-    let empty: RouterState = { Registrations = Map.empty; Pending = [] }
+    let empty: RouterState = { Registrations = Map.empty; Pending = []; Ended = Set.empty }
+    let sessionKey (endpoint: Endpoint) = endpoint.Harness, endpoint.Session
+    let hasEnded endpoint state = Set.contains (sessionKey endpoint) state.Ended
     let key (scope: Scope) (name: AgentName) = Scope.key scope + sep + AgentName.key name
     let ownsName name (registration: Registration) =
         AgentName.equivalent name registration.Name || registration.Aliases |> List.exists (AgentName.equivalent name)
@@ -103,15 +106,17 @@ module Router =
         | Some registration -> forPeer registration mail
         | None -> Scope.key mail.Scope = Scope.key scope && mail.Envelope.ToPeer.IsNone && AgentName.equivalent mail.Envelope.To address
 
-    let private release (endpoint: Endpoint) (state: RouterState) =
+    let private releaseSession harness session (state: RouterState) =
         let registrations, intents =
             state.Registrations
             |> Map.fold (fun (registrations, intents) key registration ->
-                if Binding.endpoint registration.Binding = Some endpoint then
+                if Binding.endpoint registration.Binding |> Option.exists (fun e -> e.Harness = harness && e.Session = session) then
                     Map.add key { registration with Binding = Unbound } registrations,
                     ReleaseBinding registration.Name :: intents
                 else registrations, intents) (state.Registrations, [])
-        { state with Registrations = registrations }, List.rev intents
+        { state with Registrations = registrations; Ended = Set.add (harness, session) state.Ended }, List.rev intents
+
+    let private release (endpoint: Endpoint) state = releaseSession endpoint.Harness endpoint.Session state
 
     let private notice now (mail: PendingMail) envelope =
         { Envelope = envelope
@@ -176,7 +181,8 @@ module Router =
                 Scope.key r.Scope = Scope.key endpoint.Scope && Binding.isLive r.Binding && RouterState.ownsName name r)
         let current = RouterState.boundTo endpoint state
         let retained = current |> Option.exists (RouterState.ownsName name)
-        if not retained && ((PeerId.tryParse(AgentName.value name) |> Option.isSome) || (PeerAddress.tryParse(AgentName.value name) |> Option.isSome)) then state, [ Decline(ReservedName name) ]
+        if RouterState.hasEnded endpoint state then state, [ Decline(EndedSession endpoint) ]
+        elif not retained && ((PeerId.tryParse(AgentName.value name) |> Option.isSome) || (PeerAddress.tryParse(AgentName.value name) |> Option.isSome)) then state, [ Decline(ReservedName name) ]
         elif occupied |> Option.exists (fun owner -> current |> Option.forall (fun self -> self.Id <> owner.Id)) then
             state, [ Decline(NameInUse name) ]
         else
@@ -257,6 +263,7 @@ module Router =
     /// Stable session-derived names are defaults, never substitutes for requested names.
     let announce now (endpoint: Endpoint) (state: RouterState) =
         match RouterState.boundTo endpoint state with
+        | _ when RouterState.hasEnded endpoint state -> state, []
         | Some _ -> state, []
         | None ->
             let (SessionId session) = endpoint.Session
@@ -277,6 +284,7 @@ module Router =
         match event with
         | AgentInvoked _ -> state, []
         | SessionEnded endpoint -> release endpoint state
+        | SessionRemoved(harness, session) -> releaseSession harness session state
 
     /// Only the matching active attempt may update a pending item.
     let completed (now: DateTimeOffset) (endpoint: Endpoint) (envelope: Envelope) (result: DeliveryResult) (state: RouterState) : RouterState =

@@ -1,7 +1,7 @@
 /// Who agents are, and where they currently live.
 ///
-/// An identity outlives any session: a name is a mailbox, not a process. Sessions
-/// bind to a name and later unbind; the name persists across restarts.
+/// Identity survives terminal reconnection and daemon restart. Harness session
+/// deletion ends that lifetime; a new session gets a new ID even if it reuses a name.
 namespace Collab.Domain
 
 open System

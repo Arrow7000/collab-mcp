@@ -21,6 +21,7 @@ type Refusal =
     /// Another live session already owns this name in the project.
     | NameInUse of AgentName
     /// ID-shaped addresses cannot be claimed as display names.
+    | EndedSession of Endpoint
     | ReservedName of AgentName
     | AmbiguousAddress of AgentName
     | UnknownPeerAddress of AgentName

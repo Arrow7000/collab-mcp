@@ -13,6 +13,7 @@
     <Compile Include="DeliveryTests.fs" />
     <Compile Include="StoreTests.fs" />
     <Compile Include="TransportTests.fs" />
+    <Compile Include="McpTests.fs" />
   </ItemGroup>
 
   <ItemGroup>

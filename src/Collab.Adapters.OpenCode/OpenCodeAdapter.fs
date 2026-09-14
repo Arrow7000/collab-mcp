@@ -44,7 +44,7 @@ type Observation =
     /// The identity is needed because each frame repeats every call reported before it,
     /// so without one a single call is published again for every later call around it.
     | McpToolCalled of endpoint: Endpoint * call: string * invocation: ToolInvocation
-    | SessionDeleted of endpoint: Endpoint
+    | SessionDeleted of session: SessionId
 
 module Mapping =
 
@@ -189,9 +189,11 @@ module Mapping =
                     McpToolCalled(endpoint, callIdentity endpoint step callId index, invocation))
             | _ -> []
         | EventTypes.SessionDeleted ->
+            // OC2 2.0.3 deletion is global and omits location. Its authenticated
+            // session ID ends that session in every project; it cannot attribute a call.
             field "sessionID"
-            |> Option.bind (endpointOf frame)
-            |> Option.map SessionDeleted
+            |> Option.filter (String.IsNullOrWhiteSpace >> not)
+            |> Option.map (SessionId >> SessionDeleted)
             |> Option.toList
         | _ -> []
 
@@ -345,7 +347,7 @@ type OpenCodeAdapter private (client: OpenCodeClient, ownsClient: bool) =
             | McpToolCalled(endpoint, call, invocation) ->
                 if reported.IsNew call then
                     events.Publish(AgentInvoked(endpoint, invocation))
-            | SessionDeleted endpoint -> events.Publish(SessionEnded endpoint)
+            | SessionDeleted session -> events.Publish(SessionRemoved(OpenCode, session))
 
     let connectionChanged status =
         lock gate (fun () -> connection <- status)

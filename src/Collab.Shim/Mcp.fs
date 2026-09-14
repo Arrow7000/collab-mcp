@@ -1,9 +1,8 @@
 /// The MCP half of the shim: JSON-RPC 2.0 over stdio, one object per line.
 ///
 /// Deliberately thin. It parses a call, forwards it, and wraps whatever came back as
-/// text — there is no decision here, and no wording of its own, so there is nothing in
-/// this file worth a test. Everything an agent is told is written in the daemon, which
-/// is also the only side that can know the answer.
+/// text. The shim bounds concurrent forwarding and serializes response frames; the
+/// daemon remains the owner of routing and delivery decisions.
 ///
 /// Hand-rolled rather than taking an SDK, for the same reason the SSE reader is: the
 /// subset we need is small, and one fewer dependency across a process boundary we
@@ -14,6 +13,7 @@ open System
 open System.IO
 open System.Text
 open System.Text.Json.Nodes
+open System.Threading
 open Collab.Daemon
 
 module Mcp =
@@ -70,27 +70,25 @@ module Mcp =
 ]
 """
 
-    let private input = new StreamReader(Console.OpenStandardInput(), UTF8Encoding false)
-    let private output = new StreamWriter(Console.OpenStandardOutput(), UTF8Encoding false, AutoFlush = true)
-
-    let private emit (message: JsonObject) =
+    let private emit (output: TextWriter) gate (message: JsonObject) =
         message["jsonrpc"] <- JsonValue.Create "2.0"
-        output.WriteLine(message.ToJsonString())
+        let line = message.ToJsonString()
+        lock gate (fun () -> output.WriteLine line; output.Flush())
 
-    let private reply (id: JsonNode) (payload: JsonNode) =
+    let private reply output gate (id: JsonNode) (payload: JsonNode) =
         let message = JsonObject()
         message["id"] <- id.DeepClone()
         message["result"] <- payload
-        emit message
+        emit output gate message
 
-    let private refuse (id: JsonNode) (code: int) (detail: string) =
+    let private refuse output gate (id: JsonNode) (code: int) (detail: string) =
         let problem = JsonObject()
         problem["code"] <- JsonValue.Create code
         problem["message"] <- JsonValue.Create detail
         let message = JsonObject()
         message["id"] <- id.DeepClone()
         message["error"] <- problem
-        emit message
+        emit output gate message
 
     /// A tool result is text plus a flag; the daemon has already written the text.
     let private asToolResult (answer: Answer) : JsonNode =
@@ -160,19 +158,39 @@ module Mcp =
                 return asToolResult answer
         }
 
-    /// Serve until stdin closes, which is how a harness says it is finished with us.
-    ///
-    /// One request at a time, because a harness makes one tool call at a time and
-    /// concurrency here would buy nothing but a way to interleave two answers on one
-    /// pipe.
-    let serve () : int =
-        // Before anything is asked of us, so that the daemon is listening to the harness
-        // by the time the first call needs attributing.
-        Client.warm ()
+    /// Independent sessions share this pipe. Bound forwarding without blocking reads;
+    /// control requests remain responsive and each complete response is written atomically.
+    let serveWith (input: TextReader) (output: TextWriter)
+                  (forward: JsonNode option -> Async<JsonNode>) (maxConcurrentTools: int) : int =
+        if maxConcurrentTools < 1 then invalidArg "maxConcurrentTools" "must be positive"
+        let outputGate = obj ()
+        let reply = reply output outputGate
+        let refuse = refuse output outputGate
+        use slots = new SemaphoreSlim(maxConcurrentTools, maxConcurrentTools)
+        // The initial count keeps completion open while stdin can add new requests.
+        use pending = new CountdownEvent(1)
+
+        let dispatch id parameters =
+            if not (slots.Wait 0) then
+                reply id (asToolResult { Ok = false; Text = "The collaboration shim is at its concurrent request limit. This request was not forwarded or accepted; report this rather than polling." })
+            else
+                pending.AddCount()
+                async {
+                    try
+                        try
+                            let! payload = forward parameters
+                            reply id payload
+                        with error ->
+                            try refuse id -32603 $"Tool processing failed: {error.Message}. The outcome may be unknown; do not resend automatically."
+                            with writeError -> eprintfn $"collab shim: response write failed: {writeError.Message}"
+                    finally
+                        slots.Release() |> ignore
+                        pending.Signal() |> ignore
+                } |> fun work -> Async.Start(work, cancellationToken = CancellationToken.None)
 
         let rec loop () =
             match input.ReadLine() with
-            | null -> 0
+            | null -> ()
             | line when String.IsNullOrWhiteSpace line -> loop ()
             | line ->
                 (try
@@ -196,19 +214,25 @@ module Mcp =
                             | _ -> None
 
                         match Field.text "method" request, identifier with
-                        // A notification carries no id and takes no answer.
                         | _, None -> ()
                         | Some "initialize", Some id -> reply id (initialize parameters)
                         | Some "tools/list", Some id -> reply id (listTools ())
-                        | Some "tools/call", Some id -> reply id (callTool parameters |> Async.RunSynchronously)
+                        | Some "tools/call", Some id -> dispatch id parameters
                         | Some "ping", Some id -> reply id (JsonObject() :> JsonNode)
                         | Some other, Some id -> refuse id -32601 $"unsupported method '{other}'"
                         | None, Some id -> refuse id -32600 "no method"
-                 with error ->
-                     // Never die on one bad frame: the harness has no way to restart us
-                     // mid-session, and a dropped answer is better than a dropped server.
-                     eprintfn $"collab shim: {error.Message}")
-
+                 with error -> eprintfn $"collab shim: {error.Message}")
                 loop ()
 
-        loop ()
+        try loop ()
+        finally
+            // EOF stops intake but must not drop the responses already being forwarded.
+            pending.Signal() |> ignore
+            pending.Wait()
+        0
+
+    let serve () : int =
+        Client.warm ()
+        use input = new StreamReader(Console.OpenStandardInput(), UTF8Encoding false)
+        use output = new StreamWriter(Console.OpenStandardOutput(), UTF8Encoding false, AutoFlush = true)
+        serveWith input output callTool 32

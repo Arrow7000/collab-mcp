@@ -214,8 +214,8 @@ Session deletion releases names, but a genuinely new session gets a new ID and c
 inherit mail pinned to the old peer. Missing/deleted-session reconciliation remains
 required recovery work.
 
-Version-1 persisted registrations receive deterministic full IDs. Versions 1–3
-migrate atomically to version 4, exposing a persisted eight-hex-digit public address
+Version-1 persisted registrations receive deterministic full IDs. Versions 1–4
+migrate atomically to version 5, exposing a persisted eight-hex-digit public address
 without changing full IDs or names. Earlier prefixed short addresses and full IDs
 remain accepted. Already submitted message text stays unchanged; new messages show
 bare hex IDs. Eight-character hex strings are reserved for new ID addressing.
@@ -223,6 +223,11 @@ Legacy address-shaped names and aliases still resolve where unambiguous, includi
 idempotent hello and restoring an owned alias. A name and ID identifying different
 registrations is refused as ambiguous; migration detects that conflict before saving.
 Actor identity comes from the endpoint-bound registration, not address parsing.
+Version 5 also persists deletion tombstones by harness/session ID. Deletion is final
+for that lifetime in every directory; automatic registration and explicit hello are
+checked against the tombstone in the engine's serialized decision path. OC2 2.0.3
+deletions omit location, so authenticated deletion IDs never supply tool attribution
+or a guessed project. Earlier snapshots cannot recover deletions they never stored.
 New ID allocation reserves normalized forms of legacy names and aliases.
 Short addresses are reserved across all stored peers, including inactive peers; new
 allocation retries collisions and also checks names/aliases. The full ID is checked
@@ -328,7 +333,7 @@ the resulting activity. Backend transcript checks alone are insufficient.
   by session when present; refuse malformed/conflicting metadata.
 - [x] Filter observations to the collab server and retain endpoint identity in dedupe keys.
 - [x] Require runtime session metadata and remove argument-only attribution.
-- [ ] Reject obsolete lifecycle announcements after session deletion; cover delayed
+- [x] Reject obsolete lifecycle announcements after session deletion; cover delayed
   eligibility finishing after deletion. See the Sol follow-up in the
   [adversarial review](docs/adversarial-review-2026-09-14.md).
 - [x] Automatically register newly created/viewed/executing OC2 sessions with connected
@@ -383,13 +388,17 @@ in the same transaction, bounding historical storage. The private database is `~
 
 ### M3 — bounded operation and visible behaviour
 
-- [ ] Dispatch shared MCP shim requests with bounded concurrency and serialized
+- [x] Dispatch shared MCP shim requests with bounded concurrency and serialized
   response writes; verify one slow tool does not block other sessions or ping.
+  Up to 32 tools are forwarded concurrently; excess tools receive explicit
+  pre-forwarding rejection. Control requests remain responsive and EOF drains
+  already-forwarded work.
 
 - [x] Bound outbox/mailboxes, message sizes, and audit snapshot retention.
 - [ ] Limit sender/recipient traffic and interrupts.
 - [ ] Suppress duplicate messages and prevent reply loops.
-- [ ] Define activity-aware roster cleanup without confusing idle with dead.
+- [ ] Define activity-aware roster cleanup without confusing idle with dead; retain
+  deletion protection until old lifecycle/tool observations cannot reappear.
 - [x] Add fake HTTP/SSE integration tests, an optional real OC2 check script, and Linux/macOS CI checks.
   CI configuration is added to the working tree; hosted execution is unverified.
 - [x] Verify a real OC2 2.0.3 TUI displays idle/busy queue triggers and streams replies
@@ -421,6 +430,12 @@ delivery contract; unsupported urgency must be explicit.
 - [ ] Demonstrate two peers coordinating shared edits and recovering from a dead owner.
 
 ### Evidence
+
+- 2026-09-14: both Sol findings fixed with persistent deletion guards and bounded
+  concurrent shim dispatch. All 132 tests pass. Original reproductions now pass,
+  as do real OC2 bidirectional messages, create/delete lifecycle, direct tools,
+  and TUI streaming checks. Debug builds without warnings; live version-5 migration
+  and MCP refresh preserve all five existing identities and bindings.
 
 - 2026-09-14: latest Release build checked with two real OC2 2.0.3 sessions using
   an isolated local scripted provider. Verified automatic registration before hello,

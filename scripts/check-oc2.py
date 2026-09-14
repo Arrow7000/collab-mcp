@@ -189,6 +189,20 @@ try:
   assert '[peer Crimson · '+identityAddress+']' in replyMessages,'reply did not show renamed sender and bare ID'
   print('Two OC2 agents: distinct bare hex IDs, readable default name, roster IDs/alias, rename continuity: passed.')
   print('Old-name and bare-ID sends, plus reply by sender ID in the opposite direction: passed.')
+  deleted=[]
+  for number in range(3):
+   transient=api('POST','/api/session',{'title':'transient lifecycle '+str(number),'location':{'directory':root}})['data']['id']
+   deleted.append(transient)
+   api('DELETE',f'/api/session/{transient}')
+  for _ in range(150):
+   ended={endpoint['session'] for endpoint in stateSnapshot()['ended']}
+   if set(deleted)<=ended:break
+   time.sleep(.1)
+  assert set(deleted)<=ended,'session deletion tombstones missing'
+  time.sleep(3.25) # Let project-MCP eligibility retries finish after deletion.
+  snapshot=stateSnapshot()
+  assert not any(r['binding']=='bound' and r['endpoint']['session'] in deleted for r in snapshot['registrations']),'deleted session was resurrected'
+  print('Real OC2 create/delete lifecycle retained tombstones; no delayed registration resurrection: passed.')
  if os.environ.get('PROBE_TUI')=='1':
   time.sleep(.5)
   master,slave=pty.openpty();fcntl.ioctl(slave,termios.TIOCSWINSZ,struct.pack('HHHH',35,120,0,0))

@@ -66,6 +66,7 @@ module Daemon =
         | SelfAddressed name -> $"you addressed yourself ({AgentName.value name})"
         | NameInUse name -> $"the name '{AgentName.value name}' is already owned by another session in this project; choose a different name"
         | AmbiguousAddress name -> $"'{AgentName.value name}' matches a legacy name and a different ID; use an unambiguous ID or rename the legacy name"
+        | EndedSession _ -> "this harness session has ended; it cannot register or claim a name again"
         | ReservedName name -> $"'{AgentName.value name}' is reserved for peer IDs; choose a display name"
         | UnknownPeerAddress address -> $"no peer with ID '{AgentName.value address}' exists in this project"
         | UnknownPeerId id -> $"no peer with ID '{PeerId.value id}' exists in this project"
@@ -324,7 +325,7 @@ module Daemon =
             let observed (event: HarnessEvent) =
                 (match event with
                  | AgentInvoked(endpoint, invocation) -> attribution.Record(endpoint, invocation)
-                 | SessionEnded _ -> ())
+                 | SessionEnded _ | SessionRemoved _ -> ())
 
                 async {
                     try

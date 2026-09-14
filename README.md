@@ -39,7 +39,12 @@ session-derived words and add a numeric suffix when a live name is already taken
 Registration follows session lifecycle events; a scoped tool call also repairs a missed
 registration. Cold-start gaps or reopening a conversation without a lifecycle event
 may delay presence until its next execution/tool call. Historical sessions are not
-registered wholesale.
+registered wholesale. Definitive deletion is persisted by harness/session ID, so a
+delayed lifecycle event cannot re-register that session after deletion or restart.
+
+The shared MCP shim forwards up to 32 tool requests concurrently. Slow requests
+do not block other sessions or ping. Requests above that limit are rejected before
+forwarding, and response frames retain their request IDs.
 
 Runtime session metadata is required on every tool call; project context comes from
 matching harness events. `send` takes no `from`, and agents supply no session or

@@ -59,7 +59,7 @@ module StateWire =
                     | other -> failwith $"unknown stored urgency '{other}'" }
     let encode (state: RouterState) =
         let root = JsonObject()
-        root["version"] <- JsonValue.Create 4
+        root["version"] <- JsonValue.Create 5
         let registrations = JsonArray()
         for _, r in Map.toList state.Registrations do
             let (Scope scope) = r.Scope
@@ -77,6 +77,9 @@ module StateWire =
                 node["since"] <- JsonValue.Create(date since)
             registrations.Add node
         root["registrations"] <- registrations
+        let ended = JsonArray()
+        state.Ended |> Set.iter (fun (kind, SessionId session) -> ended.Add(obj [ "harness", harness kind; "session", session ]))
+        root["ended"] <- ended
         let pending = JsonArray()
         for mail in state.Pending do
             let (Scope scope) = mail.Scope
@@ -101,7 +104,7 @@ module StateWire =
     let decode json : RouterState =
         let root = JsonNode.Parse(json: string)
         let version = root["version"].GetValue<int>()
-        if version < 1 || version > 4 then failwith "unsupported state format"
+        if version < 1 || version > 5 then failwith "unsupported state format"
         let registrations =
             root["registrations"].AsArray() |> Seq.map (fun node ->
                 let agent, scope = name "name" node, Scope(text "scope" node)
@@ -157,7 +160,12 @@ module StateWire =
                     let address = PeerAddress.allocate candidate reserved
                     reserved <- Set.add address reserved
                     { r with ShortId = address })
-        let state = { Registrations = registrations; Pending = pending }
+        let ended =
+            if version < 5 then Set.empty
+            else root["ended"].AsArray() |> Seq.map (fun node -> readHarness(text "harness" node), SessionId(text "session" node)) |> Set.ofSeq
+        let state = { Registrations = registrations; Pending = pending; Ended = ended }
+        if registrations |> Map.exists (fun _ r -> Binding.endpoint r.Binding |> Option.exists (fun e -> RouterState.hasEnded e state)) then
+            failwith "stored registration is bound to an ended session"
         // Never commit a migration that would silently redirect a preserved address.
         for _, registration in Map.toSeq registrations do
             for address in registration.Name :: registration.Aliases do
@@ -202,8 +210,8 @@ CREATE TABLE IF NOT EXISTS audit (id INTEGER PRIMARY KEY, at TEXT NOT NULL, acti
                 let payload = string value
                 let loaded = StateWire.decode payload
                 let root = JsonNode.Parse payload
-                if root["version"].GetValue<int>() < 4 then
-                    (this :> StateStore).Save(loaded, DateTimeOffset.UtcNow, "migrate prefix-free peer addresses")
+                if root["version"].GetValue<int>() < 5 then
+                    (this :> StateStore).Save(loaded, DateTimeOffset.UtcNow, "migrate persisted session deletion guards")
                 loaded)
         member _.Save(state, at, action) = lock gate (fun () ->
             let encoded = StateWire.encode state
