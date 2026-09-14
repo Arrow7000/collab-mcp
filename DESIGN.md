@@ -188,10 +188,12 @@ server is connected. The default peer name is `oc2-` plus a stable session-deriv
 This does not enumerate historical conversations, execute model work, or wake an idle
 session. A scoped `roster`/`send` call also repairs a missed lifecycle registration.
 
-`hello` is optional: it can replace an unused generated name with an explicit name.
-Once any peer message is accepted from or to that identity, the default name is fixed;
-this avoids stranding accepted mail or changing an identity peers already used.
-Existing explicit names are preserved. Invalid or colliding requested names are refused.
+`hello` is optional and changes the display name without changing the durable peer ID.
+Roster entries expose current name, ID, and previous names; new messages expose sender
+name and ID. Previous names remain reserved aliases while the peer is live (at most
+64). Send accepts names or IDs; known recipients are pinned by ID before delivery.
+Unknown names park until first claimed; unknown IDs are refused. IDs cannot be claimed
+as display names. Existing explicit names are preserved during automatic registration.
 
 The cost is that the router cannot distinguish "still booting" from "misaddressed" at
 send time, so it must assume the former and park under a deadline. Peers spawned
@@ -202,11 +204,16 @@ substitution.
 
 **Ownership.** One live endpoint owns one name, and one name has one live owner in its
 project. Repeating `hello` with an equivalent name preserves the original spelling and
-binding timestamps. A different name is refused after explicit naming or the first
-accepted exchange; only an unused provisional default can be replaced.
-A competing live session cannot replace the owner. Session deletion releases the
-binding, after which a restarted session can claim that mailbox and its waiting mail.
-Reconciliation of missing/deleted sessions remains required recovery work.
+binding timestamps. Renaming preserves the ID, timestamps, and mailbox; changing back
+to an alias is allowed. A competing live session cannot claim its names or aliases.
+Terminal reconnection to the same harness session and daemon restart preserve identity.
+Session deletion releases names, but a genuinely new session gets a new ID and cannot
+inherit mail pinned to the old peer. Missing/deleted-session reconciliation remains
+required recovery work.
+
+Version-1 persisted registrations migrate atomically to version 2 with deterministic
+IDs. Legacy pending messages retain their exact original rendered text so reconciliation
+can still identify an already admitted message; newly created messages carry IDs.
 
 **Nothing about an agent's identity or location is taken from the agent.** An agent
 supplies only the name it wishes to be known by, and who it is writing to. Which session
@@ -294,8 +301,10 @@ the resulting activity. Backend transcript checks alone are insufficient.
 
 - [x] Enforce one active name per endpoint and one active endpoint per name.
   Repeating hello with the same name is idempotent and preserves displayed spelling;
-  requesting a different name is refused. Another live owner blocks a claim. An
-  unbound name can be reclaimed after session deletion.
+  renaming preserves the peer ID and reserves previous names as aliases. Another
+  live owner blocks a claim. A new session may reuse released names with a new ID.
+- [x] Add durable peer IDs, safe renaming, and addressing by ID or reserved alias;
+  migrate persisted state and verify actual OC2 rename/delivery.
 - [x] Add deterministic regression tests and include them in `dotnet test`.
 - [x] Inspect installed and current V2 MCP call paths for harness-supplied context.
 - [x] Forward session metadata independently of arguments and constrain event matching
@@ -389,6 +398,12 @@ delivery contract; unsupported urgency must be explicit.
 - [ ] Demonstrate two peers coordinating shared edits and recovering from a dead owner.
 
 ### Evidence
+
+- 2026-09-14: durable peer IDs, safe renaming, reserved aliases, and name/ID addressing
+  implemented. SQLite migration and restart preserve identity. Real OC2 verifies that
+  old-name and ID sends reach the renamed peer and expose the sender ID. All 99
+  tests pass; Debug builds without warnings. The live migration preserved both
+  existing names and session bindings, and bootstrap registration still passes.
 
 - 2026-09-14: session metadata forwarding, session-constrained event matching, server
   filtering, and endpoint-scoped dedupe implemented. All 40 regression cases pass;

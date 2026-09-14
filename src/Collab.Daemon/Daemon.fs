@@ -65,8 +65,9 @@ module Daemon =
         | QueueFull detail -> $"{detail}; this message was not accepted"
         | SelfAddressed name -> $"you addressed yourself ({AgentName.value name})"
         | NameInUse name -> $"the name '{AgentName.value name}' is already owned by another session in this project; choose a different name"
-        | AlreadyNamed(current, requested) ->
-            $"you are already known as '{AgentName.value current}'; hello cannot change your name to '{AgentName.value requested}'"
+        | ReservedName name -> $"'{AgentName.value name}' is reserved for peer IDs; choose a display name"
+        | UnknownPeerId id -> $"no peer with ID '{PeerId.value id}' exists in this project"
+        | AliasLimit _ -> "this peer already retains 64 previous names; its name was not changed"
 
     let private urgencyOf (input: JsonNode) =
         match Field.text "urgency" input with
@@ -90,7 +91,7 @@ module Daemon =
 
                 let mine =
                     match view.Caller with
-                    | Some caller when AgentName.equivalent caller.Name registration.Name -> " (you)"
+                    | Some caller when caller.Id = registration.Id -> " (you)"
                     | _ -> ""
 
                 let live =
@@ -99,7 +100,11 @@ module Daemon =
                     else
                         " — announced earlier, not currently running"
 
-                $"  {name}{mine}{live}"
+                let previous =
+                    match registration.Aliases with
+                    | [] -> ""
+                    | aliases -> " (previous names: " + (aliases |> List.map AgentName.value |> String.concat ", ") + ")"
+                $"  {name} [{PeerId.value registration.Id}]{mine}{previous}{live}"
 
             let listing = view.Everyone |> List.map line |> String.concat "\n"
 

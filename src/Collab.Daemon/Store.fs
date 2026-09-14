@@ -35,23 +35,37 @@ module StateWire =
           Session = SessionId(text "session" node); Scope = Scope(text "scope" node) }
     let private envelope (e: Envelope) =
         let (MessageId id) = e.Id
-        obj [ "id", string id; "from", AgentName.value e.From; "to", AgentName.value e.To
-              "body", e.Body; "urgency", (match e.Urgency with Interrupt -> "interrupt" | AtTurnBoundary -> "queue")
-              "sentAt", date e.SentAt ]
+        let node =
+            obj [ "id", string id; "from", AgentName.value e.From; "to", AgentName.value e.To
+                  "body", e.Body; "urgency", (match e.Urgency with Interrupt -> "interrupt" | AtTurnBoundary -> "queue")
+                  "sentAt", date e.SentAt ]
+        node["legacyFormat"] <- JsonValue.Create e.LegacyFormat
+        e.FromPeer |> Option.iter (fun id -> node["fromPeer"] <- JsonValue.Create(PeerId.value id))
+        e.ToPeer |> Option.iter (fun id -> node["toPeer"] <- JsonValue.Create(PeerId.value id))
+        node
+    let private peer key node =
+        Field.text key node |> Option.map (fun raw ->
+            PeerId.tryParse raw |> Option.defaultWith (fun () -> failwith $"invalid stored peer ID '{key}'"))
     let private readEnvelope node =
-        { Id = MessageId(Guid.Parse(text "id" node)); From = name "from" node; To = name "to" node
+        { Id = MessageId(Guid.Parse(text "id" node))
+          LegacyFormat = if isNull node["legacyFormat"] then false else node["legacyFormat"].GetValue<bool>()
+          FromPeer = peer "fromPeer" node; ToPeer = peer "toPeer" node
+          From = name "from" node; To = name "to" node
           Body = text "body" node; SentAt = at "sentAt" node
           Urgency = match text "urgency" node with
                     | "interrupt" -> Interrupt | "queue" -> AtTurnBoundary
                     | other -> failwith $"unknown stored urgency '{other}'" }
     let encode (state: RouterState) =
         let root = JsonObject()
-        root["version"] <- JsonValue.Create 1
+        root["version"] <- JsonValue.Create 2
         let registrations = JsonArray()
         for _, r in Map.toList state.Registrations do
             let (Scope scope) = r.Scope
             let node = obj [ "name", AgentName.value r.Name; "scope", scope; "firstSeen", date r.FirstSeen ]
-            node["provisional"] <- JsonValue.Create r.Provisional
+            node["peerId"] <- JsonValue.Create(PeerId.value r.Id)
+            let aliases = JsonArray()
+            r.Aliases |> List.iter (fun alias -> aliases.Add(JsonValue.Create(AgentName.value alias)))
+            node["aliases"] <- aliases
             match r.Binding with
             | Unbound -> node["binding"] <- JsonValue.Create "unbound"
             | Bound(e, since) ->
@@ -83,7 +97,8 @@ module StateWire =
 
     let decode json : RouterState =
         let root = JsonNode.Parse(json: string)
-        if root["version"].GetValue<int>() <> 1 then failwith "unsupported state format"
+        let version = root["version"].GetValue<int>()
+        if version <> 1 && version <> 2 then failwith "unsupported state format"
         let registrations =
             root["registrations"].AsArray() |> Seq.map (fun node ->
                 let agent, scope = name "name" node, Scope(text "scope" node)
@@ -92,9 +107,15 @@ module StateWire =
                     | "unbound" -> Unbound
                     | "bound" -> Bound(readEndpoint node["endpoint"], at "since" node)
                     | other -> failwith $"unknown stored binding '{other}'"
-                RouterState.key scope agent,
-                { Name = agent; Scope = scope; Binding = binding; FirstSeen = at "firstSeen" node
-                  Provisional = if isNull node["provisional"] then false else node["provisional"].GetValue<bool>() })
+                let id =
+                    if version = 1 then PeerId.legacy (Scope.key scope + "\u001f" + AgentName.key agent + "\u001f" + text "firstSeen" node)
+                    else peer "peerId" node |> Option.defaultWith (fun () -> failwith "missing peer ID")
+                let aliases =
+                    if version = 1 then []
+                    else node["aliases"].AsArray() |> Seq.map (fun n ->
+                        AgentName.create(n.GetValue<string>()) |> Result.defaultWith (fun e -> failwithf "invalid alias %A" e)) |> Seq.toList
+                PeerId.value id,
+                { Id = id; Aliases = aliases; Name = agent; Scope = scope; Binding = binding; FirstSeen = at "firstSeen" node })
             |> Map.ofSeq
         let pending =
             root["pending"].AsArray() |> Seq.map (fun node ->
@@ -109,9 +130,17 @@ module StateWire =
                            | "uncertain" -> Uncertain(readEndpoint node["endpoint"], text "detail" node)
                            | other -> failwith $"unknown stored delivery state '{other}'" })
             |> Seq.toList
-        { Registrations = registrations; Pending = pending }
+        let state = { Registrations = registrations; Pending = pending }
+        if version = 1 then
+            // Pin routing IDs while leaving already-submitted synthetic text unchanged.
+            let migrated = pending |> List.map (fun mail ->
+                let target = RouterState.lookup mail.Scope mail.Envelope.To state |> Option.map _.Id
+                let sender = RouterState.lookup mail.Scope mail.Envelope.From state |> Option.map _.Id
+                { mail with Envelope = { mail.Envelope with ToPeer = target; FromPeer = sender; LegacyFormat = true } })
+            { state with Pending = migrated }
+        else state
 
-type SqliteStateStore(path: string) =
+type SqliteStateStore(path: string) as this =
     let gate = obj ()
     let settings = SqliteConnectionStringBuilder(DataSource = path, Pooling = false)
     let connection = new SqliteConnection(settings.ToString())
@@ -135,7 +164,13 @@ CREATE TABLE IF NOT EXISTS audit (id INTEGER PRIMARY KEY, at TEXT NOT NULL, acti
             command.CommandText <- "SELECT payload FROM state WHERE id=1"
             match command.ExecuteScalar() with
             | null -> RouterState.empty
-            | value -> StateWire.decode (string value))
+            | value ->
+                let payload = string value
+                let loaded = StateWire.decode payload
+                let root = JsonNode.Parse payload
+                if root["version"].GetValue<int>() = 1 then
+                    (this :> StateStore).Save(loaded, DateTimeOffset.UtcNow, "migrate stable peer IDs")
+                loaded)
         member _.Save(state, at, action) = lock gate (fun () ->
             let encoded = StateWire.encode state
             use transaction = connection.BeginTransaction()

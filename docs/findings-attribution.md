@@ -120,3 +120,12 @@ them. Explicit naming can replace an unused default; after communication, the na
 fixed to preserve peer continuity and queued addressing. Stable peer IDs and safe
 mid-conversation rename semantics are a subsequent design question raised by the user.
 The live daemon was updated and both existing explicit peer identities were preserved.
+
+### Durable identity and renaming
+
+The provisional-name restriction above is superseded by durable peer IDs. A scoped
+endpoint retains one ID across renaming and daemon restart; prior names are reserved
+aliases while live. Messages include sender IDs, and recipient IDs pin accepted mail
+so name changes cannot redirect it. A new session reusing a released name has a new
+identity and cannot inherit old pinned mail. The isolated real OC2 identity check
+verifies renaming and delivery through both the old name and ID.

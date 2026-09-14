@@ -26,6 +26,9 @@ type Urgency =
 /// without disturbing delivery.
 type Envelope =
     { Id: MessageId
+      LegacyFormat: bool
+      FromPeer: PeerId option
+      ToPeer: PeerId option
       From: AgentName
       To: AgentName
       Body: string
@@ -46,6 +49,8 @@ module Envelope =
         { envelope with
             Id = MessageId(Guid.NewGuid())
             To = envelope.From
+            ToPeer = envelope.FromPeer
+            LegacyFormat = false
             Body = text
             Urgency = AtTurnBoundary
             SentAt = now }
@@ -54,6 +59,9 @@ module Envelope =
     /// resolved, never from anything the sender claimed.
     let seal (from: AgentName) (now: DateTimeOffset) (request: SendRequest) : Envelope =
         { Id = MessageId(Guid.NewGuid())
+          LegacyFormat = false
+          FromPeer = None
+          ToPeer = None
           From = from
           To = request.To
           Body = request.Body
@@ -72,6 +80,9 @@ module Envelope =
     /// not worth interrupting anyone for.
     let bounce (now: DateTimeOffset) (reason: string) (envelope: Envelope) : Envelope =
         { Id = MessageId(Guid.NewGuid())
+          LegacyFormat = false
+          FromPeer = envelope.FromPeer
+          ToPeer = envelope.FromPeer
           From = envelope.From
           To = envelope.From
           Body = $"undeliverable to '{AgentName.value envelope.To}': {reason}\n\nyou wrote: {envelope.Body}"

@@ -98,6 +98,23 @@ module AgentName =
 
     let equivalent (a: AgentName) (b: AgentName) : bool = key a = key b
 
+/// Public identity lasts for one peer lifetime, independent of its display names.
+type PeerId = private PeerId of Guid
+
+module PeerId =
+    let create () = PeerId(Guid.NewGuid())
+    let value (PeerId id) = "peer-" + id.ToString "N"
+    let tryParse (raw: string) =
+        if isNull raw || not (raw.StartsWith("peer-", StringComparison.OrdinalIgnoreCase)) then None
+        else
+            match Guid.TryParseExact(raw.Substring 5, "N") with
+            | true, id -> Some(PeerId id)
+            | _ -> None
+    /// Deterministic migration makes repeated reads of a legacy snapshot agree.
+    let legacy (raw: string) =
+        let bytes = System.Security.Cryptography.SHA256.HashData(System.Text.Encoding.UTF8.GetBytes raw)
+        PeerId(Guid(bytes[0..15]))
+
 module Scope =
 
     /// Harness directories are absolute. Normalize syntax but preserve case so distinct

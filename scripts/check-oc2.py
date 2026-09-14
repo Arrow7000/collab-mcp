@@ -5,7 +5,7 @@ Build Release first. Requires OC2 2.0.3+ and Python 3. No paid model calls.
 import sqlite3,argparse,pty,fcntl,termios,struct,tempfile,shutil,signal,os,json,subprocess,time,urllib.request,socket,re,base64,threading,http.server
 parser=argparse.ArgumentParser(description=__doc__)
 parser.add_argument('--oc2',required=True,help='Path to the compatible OC2 binary')
-parser.add_argument('--mode',choices=['codemode','direct','tui','bootstrap'],default='codemode')
+parser.add_argument('--mode',choices=['codemode','direct','tui','bootstrap','identity'],default='codemode')
 args=parser.parse_args()
 os.environ['PROBE_REAL']='1'
 os.environ['PROBE_DIRECT']='1' if args.mode=='direct' else '0'
@@ -34,6 +34,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
    if 'busy start' in last:text='Busy peer response streamed live.'
    if 'busy followup' in last:text='Queued peer response streamed live.'
    msg={'role':'assistant','content':text};finish='stop'
+  lastUser=json.dumps(body['messages'][-1])
+  if args.mode=='identity' and body['messages'][-1]['role']=='user':
+   code=None
+   if 'identity rename' in lastUser:code='return await tools.collab.hello({name:"Crimson"})'
+   if 'identity send' in lastUser:code='return await Promise.all([tools.collab.send({to:"Red",body:"alias payload"}),tools.collab.send({to:'+json.dumps(identityTarget)+',body:"ID payload"})])'
+   if code:
+    msg={'role':'assistant','content':None,'tool_calls':[{'id':'probe_'+str(len(requests)),'type':'function','function':{'name':'execute','arguments':json.dumps({'code':code})}}]};finish='tool_calls'
   if body.get('stream'):
    delta={k:v for k,v in msg.items() if k!='role'}
    if 'tool_calls' in delta:delta['tool_calls'][0]['index']=0
@@ -55,7 +62,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
    self.wfile.write(('data: '+json.dumps(tail)+'\n\ndata: [DONE]\n\n').encode());self.wfile.flush()
   else:self.wfile.write(raw)
 socket.getfqdn = lambda name='': name or 'localhost'
-mock=http.server.ThreadingHTTPServer(('127.0.0.1',0),Handler);threading.Thread(target=mock.serve_forever,daemon=True).start()
+mock=http.server.ThreadingHTTPServer(('127.0.0.1',0),Handler);mock.daemon_threads=False;threading.Thread(target=mock.serve_forever,daemon=True).start()
 configdir=env['XDG_CONFIG_HOME']+'/opencode';os.makedirs(configdir,exist_ok=True)
 config={'model':'mock/mock','providers':{'mock':{'package':'@opencode/ai/providers/openai-compatible','settings':{'baseURL':f'http://127.0.0.1:{mock.server_port}/v1','apiKey':'local-probe'},'models':{'mock':{'name':'Mock','tool_call':True}}}},'mcp':{'servers':{'collab':{'type':'local','codemode':os.environ.get('PROBE_DIRECT')!='1','command':['dotnet',os.path.abspath(os.path.join(os.path.dirname(__file__),'..','src','Collab.Shim','bin','Release','net10.0','collab-mcp.dll'))]}}}}
 open(configdir+'/opencode.json','w').write(json.dumps(config))
@@ -137,6 +144,33 @@ try:
    time.sleep(.1)
   assert f'Registrations: {expected} ({expected} bound)' in status.stdout,status.stdout
   print('Real OC2 -> MCP shim -> metadata/event attribution -> durable registration: passed.')
+
+ if args.mode=='identity':
+  def stateSnapshot():
+   with sqlite3.connect('file:'+env['COLLAB_MCP_HOME']+'/state.sqlite?mode=ro',uri=True) as db:
+    return json.loads(db.execute('SELECT payload FROM state WHERE id=1').fetchone()[0])
+  initial=stateSnapshot()['registrations'][0];identityTarget=initial['peerId']
+  api('POST',f'/api/session/{session}/prompt',{'text':'identity rename'})
+  for _ in range(100):
+   renamed=next((r for r in stateSnapshot()['registrations'] if r['peerId']==identityTarget),None)
+   if renamed and renamed['name']=='Crimson':break
+   time.sleep(.1)
+  assert renamed['name']=='Crimson' and 'Red' in renamed['aliases'],renamed
+  second=api('POST','/api/session',{'title':'identity sender','location':{'directory':root}})['data']['id']
+  for _ in range(100):
+   peers=stateSnapshot()['registrations']
+   if len(peers)==2:break
+   time.sleep(.1)
+  sender=next(r for r in peers if r['peerId']!=identityTarget)
+  api('POST',f'/api/session/{second}/prompt',{'text':'identity send'})
+  for _ in range(150):
+   messages=json.dumps(api('GET',f'/api/session/{session}/message?limit=100'))
+   if 'alias payload' in messages and 'ID payload' in messages:break
+   time.sleep(.1)
+  assert 'alias payload' in messages and 'ID payload' in messages,'messages did not reach renamed peer'
+  assert sender['peerId'] in messages,'sender ID missing in received message'
+  assert renamed['peerId']==initial['peerId'],'rename changed identity'
+  print('Rename retained peer ID; old-name and ID sends reached the same peer with sender ID: passed.')
  if os.environ.get('PROBE_TUI')=='1':
   time.sleep(.5)
   master,slave=pty.openpty();fcntl.ioctl(slave,termios.TIOCSWINSZ,struct.pack('HHHH',35,120,0,0))
@@ -185,8 +219,10 @@ try:
    tui.wait(timeout=10);os.close(master)
 
 finally:
+ # Drain scripted response streams while their OC2 client is still alive.
+ mock.shutdown();mock.server_close()
  if 'daemon' in locals() and daemon is not None:
   os.killpg(daemon.pid,signal.SIGTERM);daemon.wait(timeout=10);daemonLog.close();shutil.rmtree(env['COLLAB_MCP_HOME'])
  try:os.killpg(p.pid,signal.SIGTERM)
  except ProcessLookupError:pass
- p.wait(timeout=10);mock.shutdown();log.close();shutil.rmtree(root)
+ p.wait(timeout=10);log.close();shutil.rmtree(root)

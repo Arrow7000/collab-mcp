@@ -36,7 +36,7 @@ module Mcp =
 [
   {
     "name": "hello",
-    "description": "Choose an explicit peer name before exchanging messages, if you want one. OC2 sessions with collab loaded are registered automatically with a stable generated name; hello is optional. A name owned by another session is refused; choose a different name. Repeating your name is harmless. An unused generated name can be replaced once; names cannot change after messages start. You supply only a name: which session you are, and which project you are working in, are taken from your runtime rather than from you.",
+    "description": "Choose or change your peer display name at any time. OC2 sessions with collab loaded are registered automatically with a stable generated name; hello is optional. A name owned by another session is refused; choose a different name. Repeating your name is harmless. Your stable peer ID stays the same and previous names remain aliases for your lifetime, so existing conversations and queued mail keep reaching you. You supply only a name: which session you are, and which project you are working in, are taken from your runtime rather than from you.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -56,7 +56,7 @@ module Mcp =
     "inputSchema": {
       "type": "object",
       "properties": {
-        "to": { "type": "string", "description": "The name of the agent to write to, as shown by roster." },
+        "to": { "type": "string", "description": "The current name, previous name, or stable peer ID of the recipient, as shown by roster. Prefer the sender ID shown in a received message when replying." },
         "body": { "type": "string", "description": "What to say. Your own name is attached for you." },
         "urgency": {
           "type": "string",
@@ -121,7 +121,7 @@ module Mcp =
 
         payload["capabilities"] <- capabilities
         payload["serverInfo"] <- server
-        payload["instructions"] <- JsonValue.Create "OC2 sessions with collab loaded are automatically registered with a stable peer name. You do not need hello before roster or send. Roster identifies your own name and other project peers. Hello is optional to choose an explicit name before exchanging messages. Peer messages arrive automatically; end your turn when waiting for a reply and never poll."
+        payload["instructions"] <- JsonValue.Create "OC2 sessions with collab loaded are automatically registered with a stable peer name. You do not need hello before roster or send. Roster identifies your own name and other project peers. Hello is optional to choose or change a display name. Your peer ID survives renaming and reconnection; previous names stay reserved aliases during your lifetime. Address replies using the sender ID included in messages. Peer messages arrive automatically; end your turn when waiting for a reply and never poll."
         payload :> JsonNode
 
     let private listTools () : JsonNode =

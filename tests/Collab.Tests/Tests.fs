@@ -32,23 +32,26 @@ let ``repeating hello preserves spelling binding time and first seen`` () =
     equal [ CompleteClaim(red, a) ] intents
 
 [<Fact>]
-let ``hello cannot rename a session or change its sender identity`` () =
+let ``hello renames a peer while preserving its sender identity and old address`` () =
     let state = claimed red a
+    let original = (RouterState.boundTo a state).Value
     let state', intents = Router.claim now blue a state
-    equal state state'
-    equal [ Decline(AlreadyNamed(red, blue)) ] intents
-    equal None (RouterState.lookup a.Scope blue state')
-    equal (Some red) (RouterState.boundTo a state' |> Option.map _.Name)
+    equal [ CompleteClaim(blue, a) ] intents
+    let renamed = (RouterState.boundTo a state').Value
+    equal original.Id renamed.Id
+    equal blue renamed.Name
+    equal (Some renamed) (RouterState.lookup a.Scope red state')
 
 [<Fact>]
 let ``a refused rename cannot drain another mailbox's waiting mail`` () =
     let state = claimed red a
+    let state, _ = Router.claim now blue b state
     let state, _ =
         Router.send now Limits.defaults a.Scope red
             { To = blue; Body = "waiting for BlueJay"; Urgency = AtTurnBoundary } state
     let state', intents = Router.claim now blue a state
     equal state state'
-    equal [ Decline(AlreadyNamed(red, blue)) ] intents
+    equal [ Decline(NameInUse blue) ] intents
     equal 1 state'.Pending.Length
 
 [<Fact>]
@@ -62,7 +65,7 @@ let ``unrelated projects can claim the same name`` () =
     equal (Some red) (RouterState.boundTo elsewhere state' |> Option.map _.Name)
 
 [<Fact>]
-let ``a deleted session's mailbox can be reclaimed with its waiting mail`` () =
+let ``a new agent reusing a name cannot inherit a deleted agents mail`` () =
     let state = claimed red a
     let state, _ = Router.claim now blue b state
     let state, released = Router.observe (SessionEnded a) state
@@ -71,15 +74,14 @@ let ``a deleted session's mailbox can be reclaimed with its waiting mail`` () =
         Router.send now Limits.defaults b.Scope blue
             { To = red; Body = "resume the schema work"; Urgency = AtTurnBoundary } state
     Assert.True(parked |> List.exists (function Park _ -> true | _ -> false))
-    let waiting = state.Pending |> List.map _.Envelope
     let restarted = endpoint "a-restarted" "/project"
     let later = now.AddSeconds 10.
     let state', intents = Router.claim later red restarted state
-    equal [ CompleteClaim(red, restarted); PushTo(restarted, waiting.Head) ] intents
+    equal [ CompleteClaim(red, restarted) ] intents
     equal 1 state'.Pending.Length
-    equal (Delivering restarted) state'.Pending.Head.Status
+    equal (Waiting now) state'.Pending.Head.Status
     let registration = RouterState.lookup restarted.Scope red state' |> Option.get
-    equal now registration.FirstSeen
+    equal later registration.FirstSeen
     equal (Bound(restarted, later)) registration.Binding
     equal None (RouterState.boundTo a state')
 
@@ -99,7 +101,7 @@ let ``session deletion releases every legacy alias and leaves peers alone`` () =
     let state = claimed red a
     let state, _ = Router.claim now blue b state
     let alias = name "LegacyAlias"
-    let registration = { Name = alias; Scope = a.Scope; Binding = Bound(a, now); FirstSeen = now; Provisional = false }
+    let registration = { Id = PeerId.create(); Aliases = []; Name = alias; Scope = a.Scope; Binding = Bound(a, now); FirstSeen = now }
     let legacy =
         { state with Registrations = Map.add (RouterState.key a.Scope alias) registration state.Registrations }
     let state', intents = Router.observe (SessionEnded a) legacy
@@ -143,18 +145,19 @@ let ``simultaneous engine claims produce one owner and one refusal`` () =
     equal Anonymous (engine.Send(loser, request) |> Async.RunSynchronously)
 
 [<Fact>]
-let ``a refused rename leaves engine sends stamped with the original name`` () =
+let ``a rename stamps new sends with the current name and stable ID`` () =
     let clock = { new Clock with member _.Now() = now }
     let engine = Engine(clock, Limits.defaults)
     engine.Claim(red, a) |> Async.RunSynchronously |> ignore
     engine.Claim(blue, b) |> Async.RunSynchronously |> ignore
-    equal [ Decline(AlreadyNamed(red, name "AnotherName")) ]
+    equal [ CompleteClaim(name "AnotherName", a) ]
         (engine.Claim(name "AnotherName", a) |> Async.RunSynchronously)
     let request = { To = blue; Body = "schema is ready"; Urgency = AtTurnBoundary }
     match engine.Send(a, request) |> Async.RunSynchronously with
     | Decided [ PushTo(destination, envelope) ] ->
         equal b destination
-        equal red envelope.From
+        equal (name "AnotherName") envelope.From
+        Assert.True envelope.FromPeer.IsSome
         equal blue envelope.To
         equal request.Body envelope.Body
     | other -> failwithf "Expected a stamped delivery, got %A" other

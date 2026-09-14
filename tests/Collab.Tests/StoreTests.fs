@@ -86,7 +86,7 @@ let ``failed persistence rejects acknowledgement and leaves the engine responsiv
 
 [<Fact>]
 let ``unsupported state versions fail explicitly`` () =
-    Assert.ThrowsAny<Exception>(fun () -> StateWire.decode "{\"version\":2}" |> ignore) |> ignore
+    Assert.ThrowsAny<Exception>(fun () -> StateWire.decode "{\"version\":3}" |> ignore) |> ignore
 
 [<Fact>]
 let ``positive admission reconciliation is durable and matches the endpoint`` () = withDatabase (fun path ->
@@ -113,7 +113,7 @@ let ``audit history is bounded while latest state remains durable`` () = withDat
     equal sample (storage.Load()))
 
 [<Fact>]
-let ``automatic names and provisional status persist`` () = withDatabase (fun path ->
+let ``automatic names and peer IDs persist`` () = withDatabase (fun path ->
     let state, _ = Router.announce now a RouterState.empty
     use store = new SqliteStateStore(path)
     let storage = store :> StateStore
@@ -123,3 +123,69 @@ let ``automatic names and provisional status persist`` () = withDatabase (fun pa
     let state, intents = run (restarted.Snapshot()) |> Router.announce now a
     equal state (storage.Load())
     Assert.Empty intents)
+
+let private legacyPayload state =
+    let root = System.Text.Json.Nodes.JsonNode.Parse(StateWire.encode state)
+    root["version"] <- System.Text.Json.Nodes.JsonValue.Create 1
+    for node in root["registrations"].AsArray() do
+        node.AsObject().Remove "peerId" |> ignore
+        node.AsObject().Remove "aliases" |> ignore
+    for mail in root["pending"].AsArray() do
+        for key in [ "fromPeer"; "toPeer"; "legacyFormat" ] do mail["envelope"].AsObject().Remove key |> ignore
+    root.ToJsonString()
+
+[<Fact>]
+let ``legacy migration pins identities without changing admitted wire text`` () =
+    let target = { a with Session = SessionId "target" }
+    let state, _ = Router.claim now (name "Blue") target sample
+    let payload = legacyPayload state
+    let migrated = StateWire.decode payload
+    equal migrated (StateWire.decode payload)
+    let original = state.Pending.Head.Envelope
+    let pinned = migrated.Pending.Head.Envelope
+    Assert.True pinned.FromPeer.IsSome
+    Assert.True pinned.ToPeer.IsSome
+    Assert.True pinned.LegacyFormat
+    let oldWire = Collab.Adapters.OpenCode.Mapping.render { original with FromPeer = None; ToPeer = None }
+    let newWire = Collab.Adapters.OpenCode.Mapping.render pinned
+    equal oldWire newWire
+
+[<Fact>]
+let ``sqlite atomically upgrades a legacy snapshot and persists assigned IDs`` () = withDatabase (fun path ->
+    do
+        use store = new SqliteStateStore(path)
+        (store :> StateStore).Save(sample, now, "old state")
+    do
+        use connection = new SqliteConnection($"Data Source={path};Pooling=False")
+        connection.Open()
+        use command = connection.CreateCommand()
+        command.CommandText <- "UPDATE state SET payload=$payload WHERE id=1"
+        command.Parameters.AddWithValue("$payload", legacyPayload sample) |> ignore
+        command.ExecuteNonQuery() |> ignore
+    let first =
+        use store = new SqliteStateStore(path)
+        (store :> StateStore).Load()
+    use reopened = new SqliteStateStore(path)
+    equal first ((reopened :> StateStore).Load())
+    use connection = new SqliteConnection($"Data Source={path};Pooling=False")
+    connection.Open()
+    use command = connection.CreateCommand()
+    command.CommandText <- "SELECT payload FROM state WHERE id=1"
+    let root = System.Text.Json.Nodes.JsonNode.Parse(command.ExecuteScalar() :?> string)
+    equal 2 (root["version"].GetValue<int>()))
+
+[<Fact>]
+let ``renamed identity and aliases survive engine restart`` () = withDatabase (fun path ->
+    use store = new SqliteStateStore(path)
+    let storage = store :> StateStore
+    let engine = Engine(clock, Limits.defaults, store = storage)
+    run (engine.Claim(name "Red", a)) |> ignore
+    let original = (run (engine.Snapshot()) |> RouterState.boundTo a).Value
+    run (engine.Claim(name "Crimson", a)) |> ignore
+    let restarted = Engine(clock, Limits.defaults, store = storage)
+    let snapshot = run (restarted.Snapshot())
+    let renamed = (RouterState.boundTo a snapshot).Value
+    equal original.Id renamed.Id
+    equal (name "Crimson") renamed.Name
+    equal (Some renamed) (RouterState.lookup a.Scope (name "Red") snapshot)
+    equal (Some renamed) (RouterState.byId a.Scope original.Id snapshot))

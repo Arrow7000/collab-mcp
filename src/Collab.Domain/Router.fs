@@ -4,11 +4,12 @@ namespace Collab.Domain
 open System
 
 type Registration =
-    { Name: AgentName
+    { Id: PeerId
+      Aliases: AgentName list
+      Name: AgentName
       Scope: Scope
       Binding: Binding
-      FirstSeen: DateTimeOffset
-      Provisional: bool }
+      FirstSeen: DateTimeOffset }
 
 type PendingStatus =
     | Waiting of retryAfter: DateTimeOffset
@@ -54,7 +55,19 @@ module RouterState =
     let private sep = string (char 0x1F)
     let empty: RouterState = { Registrations = Map.empty; Pending = [] }
     let key (scope: Scope) (name: AgentName) = Scope.key scope + sep + AgentName.key name
-    let lookup (scope: Scope) (name: AgentName) (state: RouterState) = Map.tryFind (key scope name) state.Registrations
+    let ownsName name (registration: Registration) =
+        AgentName.equivalent name registration.Name || registration.Aliases |> List.exists (AgentName.equivalent name)
+    let byId (scope: Scope) (id: PeerId) (state: RouterState) =
+        state.Registrations |> Map.toSeq |> Seq.map snd
+        |> Seq.tryFind (fun r -> r.Id = id && Scope.key r.Scope = Scope.key scope)
+    let lookup (scope: Scope) (name: AgentName) (state: RouterState) =
+        match PeerId.tryParse (AgentName.value name) with
+        | Some id -> byId scope id state
+        | None ->
+            state.Registrations |> Map.toSeq |> Seq.map snd
+            |> Seq.filter (fun r -> Scope.key r.Scope = Scope.key scope && ownsName name r)
+            |> Seq.sortByDescending (fun r -> Binding.isLive r.Binding, r.FirstSeen)
+            |> Seq.tryHead
     let boundTo (endpoint: Endpoint) (state: RouterState) =
         state.Registrations |> Map.toSeq |> Seq.map snd
         |> Seq.tryFind (fun r -> Binding.endpoint r.Binding = Some endpoint)
@@ -65,8 +78,15 @@ module Router =
         |> List.filter (fun r -> Scope.key r.Scope = Scope.key scope)
         |> List.sortBy (fun r -> AgentName.key r.Name)
 
-    let private forMailbox scope name (mail: PendingMail) =
-        Scope.key mail.Scope = Scope.key scope && AgentName.equivalent mail.Envelope.To name
+    let private forPeer (registration: Registration) (mail: PendingMail) =
+        Scope.key mail.Scope = Scope.key registration.Scope &&
+        match mail.Envelope.ToPeer with
+        | Some id -> id = registration.Id
+        | None -> RouterState.ownsName mail.Envelope.To registration
+    let private forAddress scope address state mail =
+        match RouterState.lookup scope address state with
+        | Some registration -> forPeer registration mail
+        | None -> Scope.key mail.Scope = Scope.key scope && mail.Envelope.ToPeer.IsNone && AgentName.equivalent mail.Envelope.To address
 
     let private release (endpoint: Endpoint) (state: RouterState) =
         let registrations, intents =
@@ -107,7 +127,15 @@ module Router =
         match target with
         | None -> state, []
         | Some registration ->
-            let backlog = state.Pending |> List.filter (forMailbox registration.Scope registration.Name)
+            // A previously unknown name can become the sender's own alias on rename.
+            // Return a failure notice instead of admitting the original as peer mail.
+            let pending = state.Pending |> List.map (fun mail ->
+                if mail.Purpose = PeerMessage && mail.Envelope.ToPeer.IsNone &&
+                   mail.Envelope.FromPeer = Some registration.Id && forPeer registration mail then
+                    notice now mail (Envelope.bounce now "the recipient name now belongs to the sender" mail.Envelope)
+                else mail)
+            let state = { state with Pending = pending }
+            let backlog = state.Pending |> List.filter (forPeer registration)
             let ready = backlog |> List.takeWhile (fun mail ->
                 match mail.Status with
                 | Waiting retryAfter -> retryAfter <= now && mail.ExpiresAt > now
@@ -116,52 +144,54 @@ module Router =
             else
                 let ids = ready |> List.map (fun m -> m.Envelope.Id) |> Set.ofList
                 let pending = state.Pending |> List.map (fun mail ->
-                    if Set.contains mail.Envelope.Id ids then { mail with Status = Delivering endpoint }
+                    if Set.contains mail.Envelope.Id ids then { mail with Status = Delivering endpoint; Envelope = { mail.Envelope with ToPeer = Some registration.Id } }
                     else mail)
-                let envelopes = ready |> List.map _.Envelope
+                let envelopes = pending |> List.filter (fun mail -> Set.contains mail.Envelope.Id ids) |> List.map _.Envelope
                 let intent =
                     match envelopes with
                     | [ envelope ] -> PushTo(endpoint, envelope)
                     | _ -> Flush(endpoint, envelopes)
-                let k = RouterState.key registration.Scope registration.Name
-                let registrations = Map.add k { registration with Provisional = false } state.Registrations
-                { state with Pending = pending; Registrations = registrations }, [ intent ]
+                { state with Pending = pending }, [ intent ]
 
-    /// Repeat hello preserves identity. Live collisions and renaming are refused.
-    /// Expire overdue mail before binding so timer scheduling cannot extend deadlines.
+    /// Rename a bound peer without changing its ID, aliases, timestamps or mailbox.
     let claim (now: DateTimeOffset) (name: AgentName) (endpoint: Endpoint) (state: RouterState) : RouterState * Intent list =
-        let bind state =
-            let k = RouterState.key endpoint.Scope name
+        let occupied =
+            state.Registrations |> Map.toSeq |> Seq.map snd
+            |> Seq.tryFind (fun r ->
+                Scope.key r.Scope = Scope.key endpoint.Scope && Binding.isLive r.Binding && RouterState.ownsName name r)
+        let current = RouterState.boundTo endpoint state
+        if PeerId.tryParse(AgentName.value name) |> Option.isSome then state, [ Decline(ReservedName name) ]
+        elif occupied |> Option.exists (fun owner -> current |> Option.forall (fun self -> self.Id <> owner.Id)) then
+            state, [ Decline(NameInUse name) ]
+        else
             let registration =
-                { Name = name; Scope = endpoint.Scope; Binding = Bound(endpoint, now); Provisional = false
-                  FirstSeen = RouterState.lookup endpoint.Scope name state
-                              |> Option.map _.FirstSeen |> Option.defaultValue now }
-            let state = { state with Registrations = Map.add k registration state.Registrations }
-            let state, delivery = prepareBacklog now endpoint state
-            state, CompleteClaim(name, endpoint) :: delivery
-        match RouterState.boundTo endpoint state with
-        | Some current when AgentName.equivalent current.Name name ->
-            let k = RouterState.key current.Scope current.Name
-            let state = { state with Registrations = Map.add k { current with Provisional = false } state.Registrations }
-            let state, delivery = prepareBacklog now endpoint (expirePending now state)
-            state, CompleteClaim(current.Name, endpoint) :: delivery
-        | Some current when current.Provisional ->
-            match RouterState.lookup endpoint.Scope name state with
-            | Some { Binding = Bound _ } -> state, [ Decline(NameInUse name) ]
-            | _ -> bind { state with Registrations = Map.remove (RouterState.key current.Scope current.Name) state.Registrations }
-        | Some current -> state, [ Decline(AlreadyNamed(current.Name, name)) ]
-        | None ->
-            match RouterState.lookup endpoint.Scope name state with
-            | Some { Binding = Bound _ } -> state, [ Decline(NameInUse name) ]
-            | _ -> bind (expirePending now state)
+                match current with
+                | Some r when AgentName.equivalent r.Name name -> r
+                | Some r ->
+                    let aliases = r.Name :: r.Aliases |> List.filter (AgentName.equivalent name >> not) |> List.distinctBy AgentName.key
+                    { r with Name = name; Aliases = aliases }
+                | None ->
+                    { Id = PeerId.create(); Name = name; Aliases = []; Scope = endpoint.Scope
+                      Binding = Bound(endpoint, now); FirstSeen = now }
+            if registration.Aliases.Length > 64 then state, [ Decline(AliasLimit name) ]
+            else
+                let state = expirePending now state
+                let state = { state with Registrations = Map.add (PeerId.value registration.Id) registration state.Registrations }
+                let state, delivery = prepareBacklog now endpoint state
+                state, CompleteClaim(registration.Name, endpoint) :: delivery
 
     /// Every accepted send enters the outbox before IO, including bound recipients.
     let send (now: DateTimeOffset) (limits: Limits) (scope: Scope) (from: AgentName) (request: SendRequest) (state: RouterState) : RouterState * Intent list =
         let state = expirePending now state
         let bytes = System.Text.Encoding.UTF8.GetByteCount request.Body
         let peers = state.Pending |> List.filter (fun mail -> mail.Purpose = PeerMessage)
-        let mailboxPeers = peers |> List.filter (forMailbox scope request.To) |> List.length
-        if AgentName.equivalent from request.To then state, [ Decline(SelfAddressed request.To) ]
+        let sender = RouterState.lookup scope from state
+        let recipient = RouterState.lookup scope request.To state
+        let mailboxPeers = peers |> List.filter (forAddress scope request.To state) |> List.length
+        let self = match sender, recipient with Some a, Some b -> a.Id = b.Id | _ -> AgentName.equivalent from request.To
+        if self then state, [ Decline(SelfAddressed request.To) ]
+        elif recipient.IsNone && (PeerId.tryParse(AgentName.value request.To) |> Option.isSome) then
+            state, [ Decline(UnknownPeerId(PeerId.tryParse(AgentName.value request.To) |> Option.get)) ]
         elif bytes > limits.MaxBodyBytes then state, [ Decline(MessageTooLarge(bytes, limits.MaxBodyBytes)) ]
         // Reserve half the bounded outbox for failure notices; uncertain peers may need one.
         elif peers.Length >= limits.MaxPending / 2 || state.Pending.Length >= limits.MaxPending - 1 then
@@ -169,17 +199,16 @@ module Router =
         elif mailboxPeers >= limits.MaxMailboxPeers then
             state, [ Decline(QueueFull "the recipient mailbox is full") ]
         else
-            let envelope = Envelope.seal from now request
+            let envelope =
+                { Envelope.seal from now request with
+                    FromPeer = sender |> Option.map _.Id
+                    ToPeer = recipient |> Option.map _.Id }
             let until = now + limits.ParkWindow
             let mail =
                 { Envelope = envelope; Scope = scope; ParkedAt = now; ExpiresAt = until
                   Status = Waiting now; Purpose = PeerMessage }
-            let alreadyWaiting = state.Pending |> List.exists (forMailbox scope request.To)
-            let registrations =
-                state.Registrations |> Map.map (fun _ r ->
-                    if Scope.key r.Scope = Scope.key scope && (AgentName.equivalent r.Name from || AgentName.equivalent r.Name request.To)
-                    then { r with Provisional = false } else r)
-            let state = { state with Pending = state.Pending @ [ mail ]; Registrations = registrations }
+            let alreadyWaiting = state.Pending |> List.exists (forAddress scope request.To state)
+            let state = { state with Pending = state.Pending @ [ mail ] }
             match RouterState.lookup scope request.To state with
             | Some { Binding = Bound(endpoint = endpoint) } when not alreadyWaiting ->
                 prepareBacklog now endpoint state
@@ -194,13 +223,7 @@ module Router =
             let digest = System.Security.Cryptography.SHA256.HashData(System.Text.Encoding.UTF8.GetBytes session)
             let raw = "oc2-" + Convert.ToHexString(digest).ToLowerInvariant().Substring(0, 16)
             let name = AgentName.create raw |> Result.defaultWith (fun e -> failwithf "%A" e)
-            let next, intents = claim now name endpoint state
-            let k = RouterState.key endpoint.Scope name
-            match RouterState.lookup endpoint.Scope name next with
-            | Some r when Binding.endpoint r.Binding = Some endpoint ->
-                let provisional = not (next.Pending |> List.exists (forMailbox endpoint.Scope name))
-                { next with Registrations = Map.add k { r with Provisional = provisional } next.Registrations }, intents
-            | _ -> next, intents
+            claim now name endpoint state
 
     let observe (event: HarnessEvent) (state: RouterState) =
         match event with

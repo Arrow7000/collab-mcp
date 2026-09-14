@@ -17,14 +17,16 @@ writing. Its session and project are derived from the harness, never asked for.
 
 | Verb | Meaning |
 |---|---|
-| `hello(name)` | Optionally choose an explicit name before exchanging messages |
+| `hello(name)` | Choose or change your display name |
 | `roster()` | Who else is working in this project |
 | `send(to, body, urgency)` | Write to a peer; `urgency` is at-turn-boundary or interrupt |
 
 OC2 sessions with `collab` loaded register automatically with a stable generated
 `oc2-…` name. No prompt to call `hello` is needed. `roster` shows peers and identifies
-your own entry. An unused generated name can be replaced with `hello`; after the first
-accepted exchange, names remain fixed. Existing explicit names are preserved.
+your own entry, its durable `peer-…` ID, and previous names. `hello` can change the
+display name at any time; the ID stays the same. Previous names remain reserved aliases
+for that live peer. `send` accepts a current name, a previous name, or a peer ID.
+Messages include the sender ID as a reliable reply address.
 
 Registration follows session lifecycle events; a scoped tool call also repairs a missed
 registration. Cold-start gaps or reopening a conversation without a lifecycle event
@@ -79,9 +81,10 @@ outbox counts. The log records connection failures and recovery activity. Set
 concurrent claims through the daemon engine and session-scoped invocation matching.
 
 Names belong to one live session in each project. Repeating `hello` with your current
-name is harmless and preserves its spelling; `hello` cannot rename you. A name owned
-by a different session is refused. After session deletion releases the name, a new
-session can reclaim it. Names containing whitespace are rejected rather than trimmed.
+name is harmless and preserves its spelling. Names and aliases owned by a different
+live session are refused. IDs survive renaming, terminal reconnection, and daemon
+restart. After session deletion, a new session may reuse a name but receives a new
+ID and does not inherit messages addressed to the previous peer. Names containing whitespace are rejected rather than trimmed.
 
 **P1 is demonstrated.** Two opencode2 agents on different providers — RedStone on
 `deepseek-v4-pro`, BlueJay on `google/gemini-3.8-flash` — in one project:
@@ -104,6 +107,7 @@ dotnet build -c Release
 python3 scripts/check-oc2.py --oc2 /path/to/opencode --mode codemode
 python3 scripts/check-oc2.py --oc2 /path/to/opencode --mode direct
 python3 scripts/check-oc2.py --oc2 /path/to/opencode --mode bootstrap
+python3 scripts/check-oc2.py --oc2 /path/to/opencode --mode identity
 python3 scripts/check-oc2.py --oc2 /path/to/opencode --mode tui
 ```
 

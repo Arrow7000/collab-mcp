@@ -21,7 +21,9 @@ type Refusal =
     /// Another live session already owns this name in the project.
     | NameInUse of AgentName
     /// A session has one name; a later hello cannot silently change its sender identity.
-    | AlreadyNamed of current: AgentName * requested: AgentName
+    | ReservedName of AgentName
+    | UnknownPeerId of PeerId
+    | AliasLimit of AgentName
 
 /// Failures the harness reports. Distinct from `Refusal`: these are things that went
 /// wrong, not rules we enforced.

@@ -35,8 +35,8 @@ let ``a missing session releases its name and retains the original message`` () 
     equal (Some Unbound) (RouterState.lookup b.Scope blue state |> Option.map _.Binding)
     let restarted = { b with Session = SessionId "b-restarted" }
     let state, intents = Router.claim now blue restarted state
-    equal [ CompleteClaim(blue, restarted); PushTo(restarted, mail.Envelope) ] intents
-    equal (Delivering restarted) state.Pending.Head.Status
+    equal [ CompleteClaim(blue, restarted) ] intents
+    equal (Waiting now) state.Pending.Head.Status
 
 [<Fact>]
 let ``known pre-request outages retry later without changing the message ID`` () =
@@ -222,7 +222,6 @@ let ``automatic registration is stable unique and idempotent`` () =
     let first, _ = Router.announce now a RouterState.empty
     let registration = RouterState.boundTo a first |> Option.get
     Assert.StartsWith("oc2-", AgentName.value registration.Name)
-    Assert.True registration.Provisional
     let repeated, intents = Router.announce (now.AddMinutes 1.) a first
     equal first repeated
     Assert.Empty intents
@@ -236,7 +235,6 @@ let ``explicit hello can replace an unused automatic name`` () =
     let state, _ = Router.claim now red a state
     let registration = RouterState.boundTo a state |> Option.get
     equal red registration.Name
-    Assert.False registration.Provisional
     equal 1 state.Registrations.Count
 
 [<Fact>]
@@ -246,22 +244,82 @@ let ``automatic naming never replaces an explicit identity`` () =
     Assert.Empty intents
 
 [<Fact>]
-let ``sending fixes the automatic name before communication`` () =
+let ``renaming after sending keeps existing envelope identity and provenance immutable`` () =
     let state, _ = Router.announce now a RouterState.empty
-    let sender = (RouterState.boundTo a state).Value.Name
-    let state, _ = Router.send now Limits.defaults a.Scope sender (request "hello") state
-    let registration = (RouterState.boundTo a state).Value
-    Assert.False registration.Provisional
-    let unchanged, intents = Router.claim now red a state
-    equal state unchanged
-    equal [ Decline(AlreadyNamed(sender, red)) ] intents
+    let sender = (RouterState.boundTo a state).Value
+    let state, _ = Router.send now Limits.defaults a.Scope sender.Name (request "hello") state
+    let envelope = state.Pending.Head.Envelope
+    let renamed, intents = Router.claim now red a state
+    equal [ CompleteClaim(red, a) ] intents
+    equal sender.Id (RouterState.boundTo a renamed).Value.Id
+    equal envelope renamed.Pending.Head.Envelope
 
 [<Fact>]
-let ``receiving mail fixes an automatic name without orphaning its mailbox`` () =
+let ``renaming during delivery keeps the same recipient mailbox and attempt`` () =
     let state, _ = Router.announce now b senderOnly
-    let recipient = (RouterState.boundTo b state).Value.Name
-    let state, _ = Router.send now Limits.defaults a.Scope red { To = recipient; Body = "hello"; Urgency = AtTurnBoundary } state
-    Assert.False (RouterState.boundTo b state).Value.Provisional
-    let unchanged, intents = Router.claim now blue b state
+    let recipient = (RouterState.boundTo b state).Value
+    let state, _ = Router.send now Limits.defaults a.Scope red { To = recipient.Name; Body = "hello"; Urgency = AtTurnBoundary } state
+    let envelope = state.Pending.Head.Envelope
+    let renamed, intents = Router.claim now blue b state
+    equal [ CompleteClaim(blue, b) ] intents
+    equal recipient.Id (RouterState.boundTo b renamed).Value.Id
+    equal envelope renamed.Pending.Head.Envelope
+    Assert.Empty (Router.completed now b envelope Admitted renamed).Pending
+
+[<Fact>]
+let ``previous names and IDs address the same renamed peer`` () =
+    let original = (RouterState.boundTo b both).Value
+    let renamed = AgentName.create "Indigo" |> Result.defaultWith (fun e -> failwithf "%A" e)
+    let state, _ = Router.claim now renamed b both
+    for address in [ blue; renamed; name(PeerId.value original.Id) ] do
+        let sent, intents = Router.send now Limits.defaults a.Scope red { request "hello" with To = address } state
+        let mail = Assert.Single sent.Pending
+        equal (Some original.Id) mail.Envelope.ToPeer
+        equal [ PushTo(b, mail.Envelope) ] intents
+        equal (Some (RouterState.boundTo a state).Value.Id) mail.Envelope.FromPeer
+
+[<Fact>]
+let ``a live peers previous name cannot be taken by another session`` () =
+    let state, _ = Router.claim now (name "Indigo") b both
+    let unchanged, intents = Router.claim now blue a state
     equal state unchanged
-    equal [ Decline(AlreadyNamed(recipient, blue)) ] intents
+    equal [ Decline(NameInUse blue) ] intents
+
+[<Fact>]
+let ``self addressing through a previous name or stable ID is refused`` () =
+    let original = (RouterState.boundTo a both).Value
+    let state, _ = Router.claim now (name "Crimson") a both
+    for address in [ red; name(PeerId.value original.Id) ] do
+        let unchanged, intents = Router.send now Limits.defaults a.Scope (name "Crimson") { request "hello" with To = address } state
+        equal state unchanged
+        equal [ Decline(SelfAddressed address) ] intents
+
+[<Fact>]
+let ``a peer ID cannot cross project boundaries or be claimed as a name`` () =
+    let id = (RouterState.boundTo b both).Value.Id
+    let address = name(PeerId.value id)
+    let unchanged, intents = Router.send now Limits.defaults (Scope "/elsewhere") red { request "hello" with To = address } both
+    equal both unchanged
+    equal [ Decline(UnknownPeerId id) ] intents
+    let unchanged, intents = Router.claim now address a both
+    equal both unchanged
+    equal [ Decline(ReservedName address) ] intents
+
+[<Fact>]
+let ``mailbox limits aggregate aliases and ID addresses`` () =
+    let original = (RouterState.boundTo b both).Value
+    let state, _ = Router.claim now (name "Indigo") b both
+    let limits = { Limits.defaults with MaxMailboxPeers = 1 }
+    let state, _ = Router.send now limits a.Scope red (request "first") state
+    let unchanged, intents = Router.send now limits a.Scope red { request "second" with To = name(PeerId.value original.Id) } state
+    equal state unchanged
+    equal [ Decline(QueueFull "the recipient mailbox is full") ] intents
+
+[<Fact>]
+let ``claiming an unresolved recipient as own name returns failure instead of self mail`` () =
+    let state, _ = Router.send now Limits.defaults a.Scope red (request "waiting") senderOnly
+    let state, intents = Router.claim now blue a state
+    let mail = Assert.Single state.Pending
+    equal FailureNotice mail.Purpose
+    equal (RouterState.boundTo a state |> Option.map _.Id) mail.Envelope.ToPeer
+    Assert.Contains(intents, fun intent -> match intent with PushTo(endpoint, envelope) -> endpoint = a && envelope = mail.Envelope | _ -> false)
