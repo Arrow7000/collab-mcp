@@ -36,6 +36,8 @@ type DeliveryFault =
     | HarnessRejected of status: int * detail: string
     /// A request may have been admitted, but its response was lost. Never retry blindly.
     | AdmissionUnknown of detail: string
+    /// Submitted to a notification transport; only positive harness evidence can confirm it.
+    | AwaitingReceipt of detail: string
 
 /// Delivery IO reports back to the owner of the outbox.
 type DeliveryResult =

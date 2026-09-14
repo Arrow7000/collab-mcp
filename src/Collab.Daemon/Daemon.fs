@@ -16,6 +16,7 @@ open System.Net.Sockets
 open System.Text.Json.Nodes
 open Collab.Domain
 open Collab.Adapters.OpenCode
+open Collab.Adapters.ClaudeCode
 
 module Daemon =
 
@@ -58,6 +59,7 @@ module Daemon =
         | HarnessUnreachable detail -> $"its runtime is unreachable ({detail})"
         | HarnessRejected(status, detail) -> $"its runtime refused the message with status {status}: {detail}"
         | Collab.Domain.AdmissionUnknown detail -> $"admission is uncertain ({detail}); it may already have arrived — do not resend"
+        | AwaitingReceipt detail -> $"receipt is pending ({detail}); do not resend"
 
     let private describeRefusal (refusal: Refusal) =
         match refusal with
@@ -83,7 +85,7 @@ module Daemon =
 
     /// The registry as an agent should read it: names, and whether anyone is behind
     /// them right now.
-    let private describeRoster (endpoint: Endpoint) (view: RosterView) =
+    let private describeRoster (connected: Endpoint -> bool) (endpoint: Endpoint) (view: RosterView) =
         let directory = directoryOf endpoint
 
         if List.isEmpty view.Everyone then
@@ -103,11 +105,19 @@ module Daemon =
                     else
                         " — announced earlier, not currently running"
 
+                let runtime =
+                    match Binding.endpoint registration.Binding with
+                    | Some peer when peer.Harness = ClaudeCode ->
+                        if connected peer then " (Claude Code; at_turn_boundary)"
+                        else " (Claude Code; channel disconnected, session may be resumed)"
+                    | Some _ -> " (OC2; at_turn_boundary or interrupt)"
+                    | None -> ""
+
                 let previous =
                     match registration.Aliases with
                     | [] -> ""
                     | aliases -> " (previous names: " + (aliases |> List.map AgentName.value |> String.concat ", ") + ")"
-                $"  {name} [{registration.ShortId}]{mine}{previous}{live}"
+                $"  {name} [{registration.ShortId}]{mine}{previous}{runtime}{live}"
 
             let listing = view.Everyone |> List.map line |> String.concat "\n"
 
@@ -125,6 +135,8 @@ module Daemon =
         (ports: Perform.Ports)
         (clock: Clock)
         (call: Call)
+        (trustedEndpoint: Endpoint option)
+        (connected: Endpoint -> bool)
         : Async<Answer> =
         async {
             // Arguments are checked before the session is looked up, so a malformed
@@ -133,8 +145,13 @@ module Daemon =
 
             let context = Mapping.sessionMetadata call.Metadata
             let resolve () =
-                match context with
-                | Ok session -> async {
+                match trustedEndpoint, context with
+                | Some endpoint, _ -> async {
+                    let! intents = engine.Announce endpoint
+                    let! _ = Perform.all ports clock engine intents
+                    return Some endpoint
+                  }
+                | None, Ok session -> async {
                     let! endpoint = attribution.Resolve(invocation, attributionTimeout, session = session)
                     match endpoint with
                     | Some endpoint when call.Verb <> Verbs.Hello ->
@@ -143,7 +160,7 @@ module Daemon =
                         return Some endpoint
                     | _ -> return endpoint
                   }
-                | Error error ->
+                | None, Error error ->
                     Log.write $"invalid caller metadata: {error}"
                     async { return None }
 
@@ -159,7 +176,7 @@ module Daemon =
                         "Could not work out which session this call came from, so nothing was done — nothing was sent and nothing changed. Call this once more; if it fails again, report it rather than continuing to retry."
 
             match call.Verb, context with
-            | (Verbs.Hello | Verbs.Roster | Verbs.Send), Error _ -> return unattributed
+            | (Verbs.Hello | Verbs.Roster | Verbs.Send), Error _ when trustedEndpoint.IsNone -> return unattributed
             | _, _ ->
                 match call.Verb with
                 | Verbs.Hello ->
@@ -202,7 +219,7 @@ module Daemon =
                     | None -> return unattributed
                     | Some endpoint ->
                         let! view = engine.Roster endpoint
-                        return ok (describeRoster endpoint view)
+                        return ok (describeRoster connected endpoint view)
 
                 | Verbs.Send ->
                     match Field.text "to" call.Input, Field.text "body" call.Input with
@@ -234,7 +251,7 @@ module Daemon =
                                     | [ Parked _ ] ->
                                         return
                                             ok
-                                                $"Your message to {name} is held for delivery. The router owns it and will retry known failures or report expiry. Do not resend. {endYourTurn}"
+                                                $"Your message to {name} is held for delivery or receipt confirmation. The router owns it; do not resend. {endYourTurn}"
                                     | [ Refused refusal ] -> return no $"Not sent: {describeRefusal refusal}."
                                     | [ Failed fault ] -> return no $"Could not reach {name}: {describeFault fault}."
                                     | _ -> return no "The router reached no decision, which is a bug."
@@ -315,12 +332,15 @@ module Daemon =
             let attribution = Attribution(factCapacity, factWindow, clock)
 
             use adapter = new OpenCodeAdapter()
+            let claude = ClaudeCodeAdapter(receiptFile = Path.Combine(Paths.directory(), "claude-receipts.json"))
             let port = adapter :> HarnessPort
             use _connectionSubscription = adapter.Connections.Subscribe(Observer.onNext (fun status ->
                 Log.write $"opencode event stream: {status}"))
 
             let ports kind =
-                if kind = HarnessKind.OpenCode then Some port else None
+                match kind with
+                | OpenCode -> Some port
+                | ClaudeCode -> Some(claude :> HarnessPort)
 
             let observed (event: HarnessEvent) =
                 (match event with
@@ -389,15 +409,35 @@ module Daemon =
                                 Log.write $"reconciled admitted message {mail.Envelope.Id}"
                             | Ok false -> ()
                             | Error error -> Log.write $"admission reconciliation unavailable: {error}"
+                        | Uncertain(endpoint, _) when endpoint.Harness = ClaudeCode ->
+                            let! evidence = claude.FindAdmission(endpoint, mail.Envelope)
+                            match evidence with
+                            | Ok true -> do! engine.Reconciled(endpoint, mail.Envelope)
+                            | _ -> ()
                         | _ -> ()
                 with error -> Log.write $"admission reconciliation failed: {error.Message}"
                 return! reconciling ()
             }
             Async.Start(reconciling ())
 
-            let toolDispatch = dispatch engine attribution ports clock
             let serve (call: Call) = async {
-                if call.Verb = "_status" then
+                if call.Verb = "_claude_register" then
+                    match Field.text "session" call.Input, Field.text "directory" call.Input,
+                          Field.text "token" call.Input, Field.text "socket" call.Input, Field.text "projects" call.Input with
+                    | Some session, Some directory, Some token, Some socket, Some projects
+                        when Guid.TryParse(session) |> fst
+                             && token.Length = 32 && Path.IsPathFullyQualified directory
+                             && Path.IsPathFullyQualified projects
+                             && Path.GetDirectoryName socket = Paths.directory() ->
+                        let endpoint = { Harness = ClaudeCode; Session = SessionId session; Scope = Scope(Path.GetFullPath directory) }
+                        let connection = { Endpoint = endpoint; Token = token; Socket = socket; Projects = projects; Seen = clock.Now() }
+                        if claude.Register connection then
+                            let! intents = engine.Announce endpoint
+                            let! _ = Perform.all ports clock engine intents
+                            return ok "Claude Code channel registered."
+                        else return no "Claude Code transport capacity reached."
+                    | _ -> return no "Invalid Claude Code runtime registration."
+                elif call.Verb = "_status" then
                     let! state = engine.Snapshot()
                     let waiting, delivering, uncertain =
                         state.Pending |> List.fold (fun (w, d, u) mail ->
@@ -408,7 +448,14 @@ module Daemon =
                     let bound = state.Registrations |> Map.toSeq |> Seq.sumBy (fun (_, r) ->
                         match r.Binding with Bound _ -> 1 | Unbound -> 0)
                     return ok $"Daemon PID: {Environment.ProcessId}\nEvent stream: {adapter.Connection}\nRegistrations: {state.Registrations.Count} ({bound} bound)\nOutbox: {waiting} waiting, {delivering} delivering, {uncertain} uncertain\nDatabase: {Paths.database()}\nAttribution: runtime session metadata required; argument-only matching disabled."
-                else return! toolDispatch call
+                else
+                    let token = call.Metadata |> Option.bind (Field.text "collab.claude/token")
+                    match token with
+                    | Some token ->
+                        match claude.Resolve token with
+                        | Some endpoint -> return! dispatch engine attribution ports clock call (Some endpoint) claude.IsConnected
+                        | None -> return no "Claude Code channel registration is unavailable. Nothing was done."
+                    | None -> return! dispatch engine attribution ports clock call None claude.IsConnected
             }
 
             let rec accepting () =

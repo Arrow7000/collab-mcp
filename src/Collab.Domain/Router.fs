@@ -305,6 +305,7 @@ module Router =
             | NotAdmitted(SessionGone _) ->
                 release endpoint state |> fst |> update (Waiting now)
             | NotAdmitted(HarnessUnreachable _) -> update (Waiting(now.AddSeconds 5.)) state
+            | NotAdmitted(AwaitingReceipt detail) -> update (Uncertain(endpoint, detail)) state
             | NotAdmitted(AdmissionUnknown detail) ->
                 let state = update (Uncertain(endpoint, detail)) state
                 match mail.Purpose with

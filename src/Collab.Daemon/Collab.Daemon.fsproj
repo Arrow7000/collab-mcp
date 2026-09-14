@@ -18,6 +18,7 @@
 
   <ItemGroup>
     <ProjectReference Include="..\Collab.Adapters.OpenCode\Collab.Adapters.OpenCode.fsproj" />
+    <ProjectReference Include="..\Collab.Adapters.ClaudeCode\Collab.Adapters.ClaudeCode.fsproj" />
   </ItemGroup>
 
   <ItemGroup>

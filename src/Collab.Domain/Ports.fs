@@ -12,12 +12,12 @@ open System
 /// A tool call we observed an agent make, used to attribute an MCP call to the
 /// session that made it.
 ///
-/// This exists because MCP gives a server no way to identify its caller: `clientInfo`
-/// carries no session, there are no session env vars, and the stdio process is shared
+/// OpenCode's shared MCP process cannot identify a caller from `clientInfo`:
+/// it carries no session, there are no session env vars, and the stdio process is shared
 /// across sessions (docs/findings-oc2.md). For opencode the adapter recovers
 /// attribution from the event bus, which reports both the session and the tool input.
-/// For Claude Code it reads the session id from its own environment instead. Both
-/// arrive here as the same fact.
+/// Claude Code's shim registers its endpoint directly from the native environment;
+/// it does not need invocation correlation.
 type ToolInvocation = { Tool: string; Input: string }
 
 /// What a harness tells us about its sessions.
@@ -51,7 +51,8 @@ type HarnessPort =
     ///
     /// Implementations must present it as distinct from a user turn, so provenance
     /// survives (DESIGN.md §3), and must honour `Urgency` using whatever the runtime
-    /// provides rather than by holding the message here.
+    /// provides rather than by holding the message here. Unsupported urgency must
+    /// be refused explicitly, never silently downgraded.
     abstract Deliver: endpoint: Endpoint * envelope: Envelope -> Async<Result<unit, DeliveryFault>>
 
     /// Long-lived stream of session lifecycle facts.

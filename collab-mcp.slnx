@@ -1,5 +1,6 @@
 <Solution>
   <Folder Name="/src/">
+    <Project Path="src/Collab.Adapters.ClaudeCode/Collab.Adapters.ClaudeCode.fsproj" />
     <Project Path="src/Collab.Adapters.OpenCode/Collab.Adapters.OpenCode.fsproj" />
     <Project Path="src/Collab.Daemon/Collab.Daemon.fsproj" />
     <Project Path="src/Collab.Domain/Collab.Domain.fsproj" />

@@ -14,6 +14,7 @@
     <Compile Include="StoreTests.fs" />
     <Compile Include="TransportTests.fs" />
     <Compile Include="McpTests.fs" />
+    <Compile Include="ClaudeTests.fs" />
   </ItemGroup>
 
   <ItemGroup>

@@ -1,0 +1,5 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup><TargetFramework>net10.0</TargetFramework><TreatWarningsAsErrors>true</TreatWarningsAsErrors></PropertyGroup>
+  <ItemGroup><Compile Include="Channel.fs" /></ItemGroup>
+  <ItemGroup><ProjectReference Include="../Collab.Domain/Collab.Domain.fsproj" /></ItemGroup>
+</Project>

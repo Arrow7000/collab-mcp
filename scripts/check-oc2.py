@@ -5,7 +5,7 @@ Build Release first. Requires OC2 2.0.3+ and Python 3. No paid model calls.
 import sqlite3,argparse,pty,fcntl,termios,struct,tempfile,shutil,signal,os,json,subprocess,time,urllib.request,socket,re,base64,threading,http.server
 parser=argparse.ArgumentParser(description=__doc__)
 parser.add_argument('--oc2',required=True,help='Path to the compatible OC2 binary')
-parser.add_argument('--mode',choices=['codemode','direct','tui','bootstrap','identity'],default='codemode')
+parser.add_argument('--mode',choices=['codemode','direct','tui','bootstrap','identity','claude'],default='codemode')
 args=parser.parse_args()
 os.environ['PROBE_REAL']='1'
 os.environ['PROBE_DIRECT']='1' if args.mode=='direct' else '0'
@@ -33,6 +33,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
    if 'external idle TUI check' in last:text='Idle peer response streamed live.'
    if 'busy start' in last:text='Busy peer response streamed live.'
    if 'busy followup' in last:text='Queued peer response streamed live.'
+   if args.mode=='claude' and 'Claude to OC2 payload' in last:text='OC2 peer response streamed live.'
    msg={'role':'assistant','content':text};finish='stop'
   lastUser=json.dumps(body['messages'][-1])
   if args.mode=='identity' and body['messages'][-1]['role']=='user':
@@ -41,6 +42,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
    if 'identity reply' in lastUser:code='return await tools.collab.send({to:'+json.dumps(identitySenderAddress)+',body:"reply payload"})'
    if 'identity send' in lastUser:code='return await Promise.all([tools.collab.roster({}),tools.collab.send({to:"Red",body:"alias payload"}),tools.collab.send({to:'+json.dumps(identityAddress)+',body:"ID payload"})])'
    if code:
+    msg={'role':'assistant','content':None,'tool_calls':[{'id':'probe_'+str(len(requests)),'type':'function','function':{'name':'execute','arguments':json.dumps({'code':code})}}]};finish='tool_calls'
+  if args.mode=='claude' and body['messages'][-1]['role']=='user':
+   text=str(body['messages'][-1].get('content',''))
+   if text.startswith('claude send '):
+    call=json.loads(text[len('claude send '):]);code='return await tools.collab.send('+json.dumps(call)+')'
     msg={'role':'assistant','content':None,'tool_calls':[{'id':'probe_'+str(len(requests)),'type':'function','function':{'name':'execute','arguments':json.dumps({'code':code})}}]};finish='tool_calls'
   if body.get('stream'):
    delta={k:v for k,v in msg.items() if k!='role'}
@@ -145,6 +151,10 @@ try:
    time.sleep(.1)
   assert f'Registrations: {expected} ({expected} bound)' in status.stdout,status.stdout
   print('Real OC2 -> MCP shim -> metadata/event attribution -> durable registration: passed.')
+
+ if args.mode=='claude':
+  import claude_probe
+  claude_probe.run(root,env,api,session,collab,exe,f'http://127.0.0.1:{port}',m[1])
 
  if args.mode=='identity':
   def stateSnapshot():

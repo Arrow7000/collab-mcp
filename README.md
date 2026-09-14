@@ -46,8 +46,8 @@ The shared MCP shim forwards up to 32 tool requests concurrently. Slow requests
 do not block other sessions or ping. Requests above that limit are rejected before
 forwarding, and response frames retain their request IDs.
 
-Runtime session metadata is required on every tool call; project context comes from
-matching harness events. `send` takes no `from`, and agents supply no session or
+OC2 runtime session metadata is required on every tool call; project context comes from
+matching harness events. Claude uses its native per-session MCP environment. `send` takes no `from`, and agents supply no session or
 directory arguments. Missing, malformed or conflicting metadata is refused immediately.
 
 ## Using it
@@ -69,6 +69,39 @@ server key `collab`, which the adapter uses to isolate tool-progress events. OC2
 ```
 
 The daemon keeps its socket, lock, log and SQLite database under `~/.collab-mcp`.
+
+Claude Code uses the same executable and daemon. Register the server, then launch
+an interactive session with the local development channel enabled:
+
+```bash
+claude mcp add --transport stdio --scope user collab -- <repo>/src/Collab.Shim/bin/Debug/net10.0/collab-mcp
+claude --dangerously-load-development-channels server:collab
+```
+
+Claude presents its own development-channel confirmation at launch. Keep the server
+name `collab`. A Claude session automatically gets a `claude-maple-otter` style name
+and the same bare stable ID format as OC2; `hello` can rename it. Start both harnesses
+in the same directory to share a roster. Claude 2.1.270 is the tested version.
+Channels require Anthropic authentication and any applicable organization channel
+policy. Loading the MCP tools alone does not enable push delivery.
+[Claude channel setup](https://code.claude.com/docs/en/channels).
+
+Claude channel input appears separately in the terminal and wakes an idle session;
+busy sessions queue it for the next turn. Use `at_turn_boundary` for Claude recipients;
+`interrupt` is explicitly refused. Notifications are confirmed using the native
+durable queue/transcript, rather than treating a pipe write as delivered. Unconfirmed
+submissions remain owned by the outbox and are never blindly retried. Closing an MCP
+pipe does not delete a resumable Claude conversation or release its name. Internal
+Claude subagents sharing that MCP process are represented by its conversation, not
+registered as separate peers. Channel permission approval/relay is not enabled.
+
+The optional real-harness check uses private settings and local scripted providers:
+
+```bash
+dotnet build -c Release
+python3 scripts/check-oc2.py --oc2 ~/.opencode/bin/opencode2 --mode claude
+```
+
 Inspect an existing daemon without starting one:
 
 ```bash
@@ -87,9 +120,9 @@ outbox counts. The log records connection failures and recovery activity. Set
 | `src/Collab.Adapters.OpenCode` | P1 implemented: synthetic delivery and SSE observation |
 | `src/Collab.Daemon` | SQLite registry/outbox/audit, correlation, delivery acknowledgements, Unix socket |
 | `src/Collab.Shim` | P1 implemented: three tools, spawns the daemon |
-| Claude Code adapter | P3 |
+| `src/Collab.Adapters.ClaudeCode` | Native session attribution, MCP channel push, durable receipt reconciliation |
 
-`dotnet build` from the repo root builds all four runtime projects and the test project.
+`dotnet build` from the repo root builds all five runtime projects and the test project.
 `dotnet test` runs identity ownership and attribution regression suites, including
 concurrent claims through the daemon engine and session-scoped invocation matching.
 

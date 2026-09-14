@@ -94,9 +94,10 @@ durable, so a call that begins before the router is listening can never be attri
 which is precisely the first call after a cold start, since the harness spawns the stdio
 server as part of it. That call is answered with "call again", and the second succeeds.
 
-**F7. Claude Code is different.** It *does* export `CLAUDE_CODE_SESSION_ID`,
-`CLAUDE_CODE_MESSAGING_SOCKET` and `CLAUDE_CODE_MESSAGING_TOKEN` to stdio MCP servers it
-spawns. So attribution has two shapes: env-based (Claude Code) and event-correlated
+**F7. Claude Code is different.** Claude Code 2.1.270 was verified to export
+`CLAUDE_CODE_SESSION_ID` and `CLAUDE_PROJECT_DIR` to stdio MCP servers it
+spawns. Delivery uses its opt-in MCP channel notifications, not the previously
+assumed messaging socket/token variables. Attribution has two shapes: env-based (Claude Code) and event-correlated
 (opencode). Caveat: a wrapper such as `nix-shell` scrubs the environment, so env-based
 attribution is only reliable for directly-spawned servers.
 
@@ -187,7 +188,9 @@ harness reports session creation, viewing, or execution and the project's `colla
 server is connected. The default peer name uses a harness prefix plus two session-derived words, such as
 `oc2-maple-otter`; collisions with live names/aliases get a numeric suffix. The
 prefix is `oc2-` for OpenCode and `claude-` for the domain's ClaudeCode harness.
-ClaudeCode presence is not yet implemented by an adapter.
+ClaudeCode presence is registered after its per-session MCP handshake, without a
+model call. The shim validates `clientInfo.name = claude-code` and uses only native
+environment identity; tool arguments and caller `_meta` cannot override it.
 This does not enumerate historical conversations, execute model work, or wake an idle
 session. A scoped `roster`/`send` call also repairs a missed lifecycle registration.
 
@@ -253,7 +256,16 @@ endpoint would silently merge every project into one namespace.
 Binding `name → endpoint`:
 
 - **Claude Code**: read `CLAUDE_CODE_SESSION_ID` and `CLAUDE_PROJECT_DIR` from the
-  shim's environment. Direct; no correlation needed.
+  shim's environment. Direct; no correlation needed. A private, leased per-session
+  socket bridges the daemon to the stdio channel pipe. The same router and SQLite
+  state own all identities and accepted mail. MCP shutdown is a transport outage,
+  not session deletion: resumable conversations retain identity and aliases.
+  Channel notifications do not acknowledge receipt. Exact native queue-enqueue or
+  channel-origin transcript evidence confirms admission. Until then, submitted mail
+  stays `Uncertain` and is never resubmitted automatically. `AwaitingReceipt` reports
+  ownership without a false failure notice. Private receipt-root metadata survives
+  daemon restart; live socket credentials do not. Claude channels support only
+  `AtTurnBoundary`; `Interrupt` is refused explicitly before notification IO.
 - **opencode**: lifecycle observations announce connected sessions automatically. For
   tool calls, the router matches the
   `session.tool.progress` event carrying that call and binds the emitting `sessionID`.
@@ -399,6 +411,8 @@ in the same transaction, bounding historical storage. The private database is `~
 - [ ] Suppress duplicate messages and prevent reply loops.
 - [ ] Define activity-aware roster cleanup without confusing idle with dead; retain
   deletion protection until old lifecycle/tool observations cannot reappear.
+  Claude bridge shutdown is a transport outage, not definitive conversation deletion;
+  define retirement for abandoned resumable conversations without breaking identity.
 - [x] Add fake HTTP/SSE integration tests, an optional real OC2 check script, and Linux/macOS CI checks.
   CI configuration is added to the working tree; hosted execution is unverified.
 - [x] Verify a real OC2 2.0.3 TUI displays idle/busy queue triggers and streams replies
@@ -412,12 +426,13 @@ externally triggered work in the same open session.
 
 ### M4 — cross-harness collaboration
 
-- [ ] Verify Claude Code's channel transport against its installed version, including
+- [x] Verify Claude Code's channel transport against its installed version, including
   opt-in, receipt semantics, terminal visibility, and unsupported interrupt behaviour.
 - [ ] Verify Codex's shared app-server/thread transport, external-input rendering,
   attribution, and peer provenance. Do not assume a synthetic message type exists.
-- [ ] Implement adapters behind the harness boundary.
-- [ ] Demonstrate bidirectional idle wake-up across harnesses with real TUIs open.
+- [x] Implement the Claude Code adapter behind the harness boundary.
+- [ ] Implement the Codex adapter after verifying its transport contract.
+- [x] Demonstrate bidirectional Claude Code/OC2 idle wake-up with both real TUIs open.
 
 Done when cross-harness peers share a namespace and exhibit the same supported
 delivery contract; unsupported urgency must be explicit.
@@ -430,6 +445,18 @@ delivery contract; unsupported urgency must be explicit.
 - [ ] Demonstrate two peers coordinating shared edits and recovering from a dead owner.
 
 ### Evidence
+
+- 2026-09-14: Claude Code 2.1.270 adapter implemented using native per-session
+  attribution and opt-in MCP channels. Real Claude/OC2 TUIs verified automatic
+  presence, stable IDs and rename aliases, both delivery directions, idle wake-up,
+  and busy-session turn ordering. Positive native queue/transcript evidence confirms
+  receipts; unconfirmed notification writes are never blindly retried. Claude
+  interrupts are explicitly unsupported. See [Claude findings](docs/findings-claude-code.md).
+  All 139 Release tests pass, as do the latest real OC2 identity/lifecycle and direct
+  tool regressions. Both harness integration checks use local scripted providers.
+  Debug builds without warnings. Local Claude MCP configuration preserves its
+  existing servers; the updated live daemon and OC2 MCP refresh preserve all five
+  existing identities and bindings, with an empty outbox.
 
 - 2026-09-14: both Sol findings fixed with persistent deletion guards and bounded
   concurrent shim dispatch. All 132 tests pass. Original reproductions now pass,

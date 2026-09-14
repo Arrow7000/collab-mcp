@@ -10,6 +10,7 @@
 
   <ItemGroup>
     <Compile Include="Client.fs" />
+    <Compile Include="ClaudeSession.fs" />
     <Compile Include="Mcp.fs" />
     <Compile Include="Program.fs" />
   </ItemGroup>
