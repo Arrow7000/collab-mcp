@@ -214,9 +214,11 @@ Session deletion releases names, but a genuinely new session gets a new ID and c
 inherit mail pinned to the old peer. Missing/deleted-session reconciliation remains
 required recovery work.
 
-Version-1 persisted registrations receive deterministic full IDs. Versions 1 and 2
-migrate atomically to version 3, adding a persisted `peer-` plus eight-hex-digit public
-address without changing full IDs or names. Full IDs remain accepted addresses.
+Version-1 persisted registrations receive deterministic full IDs. Versions 1–3
+migrate atomically to version 4, exposing a persisted eight-hex-digit public address
+without changing full IDs or names. Earlier prefixed short addresses and full IDs
+remain accepted. Already submitted message text stays unchanged; new messages show
+bare hex IDs. Eight-character hex strings are reserved for ID addressing.
 Short addresses are reserved across all stored peers, including inactive peers; new
 allocation retries collisions and also checks names/aliases. The full ID is checked
 for collision before insertion as well. Legacy pending messages retain their exact original rendered text so reconciliation
@@ -405,6 +407,11 @@ delivery contract; unsupported urgency must be explicit.
 - [ ] Demonstrate two peers coordinating shared edits and recovering from a dead owner.
 
 ### Evidence
+
+- 2026-09-14: removed the public ID prefix; bare hex and prior prefixed addresses
+  resolve to the same identity. Version-3 migration preserves submitted text. All
+  105 tests and the real OC2 identity check pass; the live migration preserved
+  all five registrations and session bindings.
 
 - 2026-09-14: compact eight-hex-digit public peer IDs with collision retry, backward
   compatible full-ID addressing, and readable generated names implemented. Migration

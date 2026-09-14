@@ -327,21 +327,21 @@ let ``claiming an unresolved recipient as own name returns failure instead of se
 [<Fact>]
 let ``compact IDs route to the same durable peer and cannot become names`` () =
     let peer = (RouterState.boundTo b both).Value
-    equal 13 peer.ShortId.Length
+    equal 8 peer.ShortId.Length
     equal (Some peer) (RouterState.lookup b.Scope (name(peer.ShortId.ToUpperInvariant())) both)
     let state, _ = Router.send now Limits.defaults a.Scope red { request "compact" with To = name peer.ShortId } both
     equal (Some peer.Id) state.Pending.Head.Envelope.ToPeer
     equal (Some (RouterState.boundTo a both).Value.ShortId) state.Pending.Head.Envelope.FromAddress
     equal [ Decline(ReservedName(name peer.ShortId)) ] (Router.claim now (name peer.ShortId) a both |> snd)
-    equal [ Decline(UnknownPeerAddress(name "peer-00000000")) ] (Router.send now Limits.defaults a.Scope red { request "unknown" with To = name "peer-00000000" } senderOnly |> snd)
+    equal [ Decline(UnknownPeerAddress(name "00000000")) ] (Router.send now Limits.defaults a.Scope red { request "unknown" with To = name "00000000" } senderOnly |> snd)
 
 [<Fact>]
 let ``compact ID allocator retries a collision before returning`` () =
     let mutable calls = 0
     let candidate () =
         calls <- calls + 1
-        if calls < 3 then "peer-12345678" else "peer-87654321"
-    equal "peer-87654321" (PeerAddress.allocate candidate (Set.singleton "peer-12345678"))
+        if calls < 3 then "12345678" else "87654321"
+    equal "87654321" (PeerAddress.allocate candidate (Set.singleton "12345678"))
     equal 3 calls
 
 [<Fact>]

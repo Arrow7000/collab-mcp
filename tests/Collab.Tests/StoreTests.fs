@@ -86,7 +86,7 @@ let ``failed persistence rejects acknowledgement and leaves the engine responsiv
 
 [<Fact>]
 let ``unsupported state versions fail explicitly`` () =
-    Assert.ThrowsAny<Exception>(fun () -> StateWire.decode "{\"version\":4}" |> ignore) |> ignore
+    Assert.ThrowsAny<Exception>(fun () -> StateWire.decode "{\"version\":5}" |> ignore) |> ignore
 
 [<Fact>]
 let ``positive admission reconciliation is durable and matches the endpoint`` () = withDatabase (fun path ->
@@ -172,7 +172,7 @@ let ``sqlite atomically upgrades a legacy snapshot and persists assigned IDs`` (
     use command = connection.CreateCommand()
     command.CommandText <- "SELECT payload FROM state WHERE id=1"
     let root = System.Text.Json.Nodes.JsonNode.Parse(command.ExecuteScalar() :?> string)
-    equal 3 (root["version"].GetValue<int>()))
+    equal 4 (root["version"].GetValue<int>()))
 
 [<Fact>]
 let ``renamed identity and aliases survive engine restart`` () = withDatabase (fun path ->
@@ -221,9 +221,30 @@ let ``migration resolves matching ID prefixes and rejects duplicate stored short
     let migrated = StateWire.decode(root.ToJsonString())
     let addresses = migrated.Registrations |> Map.toList |> List.map (snd >> _.ShortId)
     equal 2 (Set.ofList addresses |> Set.count)
-    Assert.Contains("peer-12345678", addresses)
+    Assert.Contains("12345678", addresses)
     equal migrated (StateWire.decode(root.ToJsonString()))
     let invalid = System.Text.Json.Nodes.JsonNode.Parse(StateWire.encode migrated)
     let duplicate = invalid["registrations"].AsArray()[1]
     duplicate["shortId"] <- System.Text.Json.Nodes.JsonValue.Create addresses.Head
     Assert.ThrowsAny<Exception>(fun () -> StateWire.decode(invalid.ToJsonString()) |> ignore) |> ignore
+
+[<Fact>]
+let ``version three removes prefixes but preserves old addresses and submitted text`` () =
+    let state = Router.claim now (name "Red") a RouterState.empty |> fst
+    let state, _ = Router.send now Limits.defaults a.Scope (name "Red") { To = name "Blue"; Body = "in flight"; Urgency = AtTurnBoundary } state
+    let original = (RouterState.boundTo a state).Value
+    let root = System.Text.Json.Nodes.JsonNode.Parse(StateWire.encode state)
+    root["version"] <- System.Text.Json.Nodes.JsonValue.Create 3
+    let registration = root["registrations"].AsArray()[0]
+    registration["shortId"] <- System.Text.Json.Nodes.JsonValue.Create("peer-" + original.ShortId)
+    let mail = root["pending"].AsArray()[0]
+    mail["envelope"]["fromAddress"] <- System.Text.Json.Nodes.JsonValue.Create("peer-" + original.ShortId)
+    let migrated = StateWire.decode(root.ToJsonString())
+    let peer = (RouterState.boundTo a migrated).Value
+    equal original.Id peer.Id
+    equal original.ShortId peer.ShortId
+    for address in [ peer.ShortId; "peer-" + peer.ShortId; PeerId.value peer.Id ] do
+        equal (Some peer) (RouterState.lookup a.Scope (name address) migrated)
+    let before = { state.Pending.Head.Envelope with FromAddress = Some("peer-" + original.ShortId) }
+    equal (Collab.Adapters.OpenCode.Mapping.render before) (Collab.Adapters.OpenCode.Mapping.render migrated.Pending.Head.Envelope)
+    equal migrated (StateWire.decode(StateWire.encode migrated))

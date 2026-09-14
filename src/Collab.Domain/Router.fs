@@ -66,7 +66,7 @@ module RouterState =
         | Some id -> byId scope id state
         | None when PeerAddress.tryParse (AgentName.value name) |> Option.isSome ->
             state.Registrations |> Map.toSeq |> Seq.map snd
-            |> Seq.tryFind (fun r -> r.ShortId = (AgentName.value name).ToLowerInvariant() && Scope.key r.Scope = Scope.key scope)
+            |> Seq.tryFind (fun r -> Some r.ShortId = PeerAddress.tryParse (AgentName.value name) && Scope.key r.Scope = Scope.key scope)
         | None ->
             state.Registrations |> Map.toSeq |> Seq.map snd
             |> Seq.filter (fun r -> Scope.key r.Scope = Scope.key scope && ownsName name r)

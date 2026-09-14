@@ -118,8 +118,10 @@ module PeerId =
 /// Compact public address; the full PeerId remains the durable identity underneath.
 module PeerAddress =
     let tryParse (raw: string) =
-        if not (isNull raw) && raw.Length = 13 && raw.StartsWith("peer-", StringComparison.OrdinalIgnoreCase) &&
-           raw.Substring(5) |> Seq.forall Uri.IsHexDigit then Some(raw.ToLowerInvariant())
+        let hex =
+            if not (isNull raw) && raw.StartsWith("peer-", StringComparison.OrdinalIgnoreCase) then raw.Substring(5)
+            else raw
+        if not (isNull hex) && hex.Length = 8 && (hex |> Seq.forall Uri.IsHexDigit) then Some(hex.ToLowerInvariant())
         else None
 
     /// The caller supplies all reserved addresses/names, including inactive peers.
@@ -127,12 +129,12 @@ module PeerAddress =
         let rec next () =
             let address = candidate ()
             match tryParse address with
-            | None -> invalidArg "candidate" "expected peer- followed by eight hexadecimal digits"
+            | None -> invalidArg "candidate" "expected eight hexadecimal digits"
             | Some address when Set.contains address reserved -> next ()
             | Some address -> address
         next ()
 
-    let random () = "peer-" + Guid.NewGuid().ToString("N").Substring(0, 8)
+    let random () = Guid.NewGuid().ToString("N").Substring(0, 8)
 
 module Scope =
 

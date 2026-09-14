@@ -59,7 +59,7 @@ module StateWire =
                     | other -> failwith $"unknown stored urgency '{other}'" }
     let encode (state: RouterState) =
         let root = JsonObject()
-        root["version"] <- JsonValue.Create 3
+        root["version"] <- JsonValue.Create 4
         let registrations = JsonArray()
         for _, r in Map.toList state.Registrations do
             let (Scope scope) = r.Scope
@@ -101,7 +101,7 @@ module StateWire =
     let decode json : RouterState =
         let root = JsonNode.Parse(json: string)
         let version = root["version"].GetValue<int>()
-        if version < 1 || version > 3 then failwith "unsupported state format"
+        if version < 1 || version > 4 then failwith "unsupported state format"
         let registrations =
             root["registrations"].AsArray() |> Seq.map (fun node ->
                 let agent, scope = name "name" node, Scope(text "scope" node)
@@ -118,7 +118,7 @@ module StateWire =
                     else node["aliases"].AsArray() |> Seq.map (fun n ->
                         AgentName.create(n.GetValue<string>()) |> Result.defaultWith (fun e -> failwithf "invalid alias %A" e)) |> Seq.toList
                 PeerId.value id,
-                { Id = id; ShortId = (if version = 3 then text "shortId" node else ""); Aliases = aliases; Name = agent; Scope = scope; Binding = binding; FirstSeen = at "firstSeen" node })
+                { Id = id; ShortId = (if version >= 3 then PeerAddress.tryParse(text "shortId" node) |> Option.defaultWith (fun () -> failwith "invalid stored short ID") else ""); Aliases = aliases; Name = agent; Scope = scope; Binding = binding; FirstSeen = at "firstSeen" node })
             |> Map.ofSeq
         if registrations.Count <> root["registrations"].AsArray().Count then failwith "duplicate stored peer ID"
         let pending =
@@ -135,7 +135,7 @@ module StateWire =
                            | other -> failwith $"unknown stored delivery state '{other}'" })
             |> Seq.toList
         let registrations =
-            if version = 3 then
+            if version >= 3 then
                 let addresses = registrations |> Map.toSeq |> Seq.map (snd >> _.ShortId) |> Seq.toList
                 if addresses |> List.exists (fun a -> PeerAddress.tryParse a <> Some a) then failwith "invalid stored short ID"
                 if (addresses |> Set.ofList |> Set.count) <> addresses.Length then failwith "duplicate stored short ID"
@@ -147,10 +147,10 @@ module StateWire =
                     let mutable attempt = -1
                     let candidate () =
                         attempt <- attempt + 1
-                        if attempt = 0 then (PeerId.value r.Id).Substring(0, 13)
+                        if attempt = 0 then (PeerId.value r.Id).Substring(5, 8)
                         else
                             let bytes = System.Security.Cryptography.SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(PeerId.value r.Id + ":" + string attempt))
-                            "peer-" + Convert.ToHexString(bytes).ToLowerInvariant().Substring(0, 8)
+                            Convert.ToHexString(bytes).ToLowerInvariant().Substring(0, 8)
                     let address = PeerAddress.allocate candidate reserved
                     reserved <- Set.add address reserved
                     { r with ShortId = address })
@@ -192,8 +192,8 @@ CREATE TABLE IF NOT EXISTS audit (id INTEGER PRIMARY KEY, at TEXT NOT NULL, acti
                 let payload = string value
                 let loaded = StateWire.decode payload
                 let root = JsonNode.Parse payload
-                if root["version"].GetValue<int>() < 3 then
-                    (this :> StateStore).Save(loaded, DateTimeOffset.UtcNow, "migrate compact peer addresses")
+                if root["version"].GetValue<int>() < 4 then
+                    (this :> StateStore).Save(loaded, DateTimeOffset.UtcNow, "migrate prefix-free peer addresses")
                 loaded)
         member _.Save(state, at, action) = lock gate (fun () ->
             let encoded = StateWire.encode state

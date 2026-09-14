@@ -23,13 +23,14 @@ writing. Its session and project are derived from the harness, never asked for.
 
 OC2 sessions with `collab` loaded register automatically with a stable generated
 `oc2-maple-otter` style name. No prompt to call `hello` is needed. `roster` shows peers and identifies
-your own entry, its short durable ID (for example `peer-a1b2c3d4`), and previous names. `hello` can change the
+your own entry, its short durable ID (for example `a1b2c3d4`), and previous names. `hello` can change the
 display name at any time; the ID stays the same. Previous names remain reserved aliases
 for that live peer. `send` accepts a current name, a previous name, or a peer ID.
 Messages include the sender ID as a reliable reply address. Short IDs use eight random
 hexadecimal digits and are checked for collisions before registration. The original
-full IDs remain valid addresses. `peer-` identifies a peer ID; `oc2-` identifies a
-generated OpenCode name, independent of model/provider. Generated names use two
+full IDs and earlier `peer-…` short addresses remain valid for compatibility.
+Eight-character hex strings are reserved for IDs rather than display names. `oc2-`
+identifies a generated OpenCode name, independent of model/provider. Generated names use two
 session-derived words and add a numeric suffix when a live name is already taken.
 
 Registration follows session lifecycle events; a scoped tool call also repairs a missed
