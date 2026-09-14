@@ -14,3 +14,19 @@ jobs:
         with:
           dotnet-version: '10.0.x'
       - run: dotnet test --configuration Release --nologo
+  pi:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - run: npm install -g @earendil-works/pi-coding-agent@0.85.1
+      - run: dotnet build --configuration Release --nologo
+      - run: python3 scripts/check-pi.py --package

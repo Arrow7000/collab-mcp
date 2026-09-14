@@ -18,9 +18,9 @@ module StateWire =
         for key, value in pairs do node[key] <- JsonValue.Create(value: string)
         node
     let private date (at: DateTimeOffset) = at.ToString "O"
-    let private harness = function OpenCode -> "opencode" | ClaudeCode -> "claude"
+    let private harness = function OpenCode -> "opencode" | ClaudeCode -> "claude" | Pi -> "pi"
     let private readHarness = function
-        | "opencode" -> OpenCode | "claude" -> ClaudeCode
+        | "opencode" -> OpenCode | "claude" -> ClaudeCode | "pi" -> Pi
         | other -> failwith $"unknown stored harness '{other}'"
     let private text key node =
         Field.text key node |> Option.defaultWith (fun () -> failwith $"missing stored field '{key}'")

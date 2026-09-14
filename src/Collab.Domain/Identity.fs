@@ -25,6 +25,7 @@ type NameError =
 type HarnessKind =
     | OpenCode
     | ClaudeCode
+    | Pi
 
 /// A harness-assigned conversation handle, opaque to the domain. We never parse it;
 /// only the owning adapter understands its shape.

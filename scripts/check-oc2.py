@@ -5,7 +5,7 @@ Build Release first. Requires OC2 2.0.3+ and Python 3. No paid model calls.
 import sqlite3,argparse,pty,fcntl,termios,struct,tempfile,shutil,signal,os,json,subprocess,time,urllib.request,socket,re,base64,threading,http.server
 parser=argparse.ArgumentParser(description=__doc__)
 parser.add_argument('--oc2',required=True,help='Path to the compatible OC2 binary')
-parser.add_argument('--mode',choices=['codemode','direct','tui','bootstrap','identity','claude'],default='codemode')
+parser.add_argument('--mode',choices=['codemode','direct','tui','bootstrap','identity','claude','pi'],default='codemode')
 args=parser.parse_args()
 os.environ['PROBE_REAL']='1'
 os.environ['PROBE_DIRECT']='1' if args.mode=='direct' else '0'
@@ -34,6 +34,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
    if 'busy start' in last:text='Busy peer response streamed live.'
    if 'busy followup' in last:text='Queued peer response streamed live.'
    if args.mode=='claude' and 'Claude to OC2 payload' in last:text='OC2 peer response streamed live.'
+   if args.mode=='pi' and 'Pi to OC2 payload' in last:text='OC2Piword response streamed live.'
    msg={'role':'assistant','content':text};finish='stop'
   lastUser=json.dumps(body['messages'][-1])
   if args.mode=='identity' and body['messages'][-1]['role']=='user':
@@ -47,6 +48,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
    text=str(body['messages'][-1].get('content',''))
    if text.startswith('claude send '):
     call=json.loads(text[len('claude send '):]);code='return await tools.collab.send('+json.dumps(call)+')'
+    msg={'role':'assistant','content':None,'tool_calls':[{'id':'probe_'+str(len(requests)),'type':'function','function':{'name':'execute','arguments':json.dumps({'code':code})}}]};finish='tool_calls'
+  if args.mode=='pi' and body['messages'][-1]['role']=='user':
+   text=str(body['messages'][-1].get('content',''))
+   if text.startswith('pi send '):
+    call=json.loads(text[len('pi send '):]);code='return await tools.collab.send('+json.dumps(call)+')'
     msg={'role':'assistant','content':None,'tool_calls':[{'id':'probe_'+str(len(requests)),'type':'function','function':{'name':'execute','arguments':json.dumps({'code':code})}}]};finish='tool_calls'
   if body.get('stream'):
    delta={k:v for k,v in msg.items() if k!='role'}
@@ -155,6 +161,9 @@ try:
  if args.mode=='claude':
   import claude_probe
   claude_probe.run(root,env,api,session,collab,exe,f'http://127.0.0.1:{port}',m[1])
+ if args.mode=='pi':
+  import pi_cross_probe
+  pi_cross_probe.run(root,env,api,session,exe,f'http://127.0.0.1:{port}',m[1])
 
  if args.mode=='identity':
   def stateSnapshot():

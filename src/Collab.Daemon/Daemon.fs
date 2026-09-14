@@ -17,6 +17,7 @@ open System.Text.Json.Nodes
 open Collab.Domain
 open Collab.Adapters.OpenCode
 open Collab.Adapters.ClaudeCode
+open Collab.Adapters.Pi
 
 module Daemon =
 
@@ -110,6 +111,9 @@ module Daemon =
                     | Some peer when peer.Harness = ClaudeCode ->
                         if connected peer then " (Claude Code; at_turn_boundary)"
                         else " (Claude Code; channel disconnected, session may be resumed)"
+                    | Some peer when peer.Harness = Pi ->
+                        if connected peer then " (Pi; at_turn_boundary)"
+                        else " (Pi; extension disconnected, session may be resumed)"
                     | Some _ -> " (OC2; at_turn_boundary or interrupt)"
                     | None -> ""
 
@@ -333,6 +337,12 @@ module Daemon =
 
             use adapter = new OpenCodeAdapter()
             let claude = ClaudeCodeAdapter(receiptFile = Path.Combine(Paths.directory(), "claude-receipts.json"))
+            let pi = PiAdapter(Path.Combine(Paths.directory(), "pi-receipts.json"))
+            let connected endpoint =
+                match endpoint.Harness with
+                | ClaudeCode -> claude.IsConnected endpoint
+                | Pi -> pi.IsConnected endpoint
+                | OpenCode -> true
             let port = adapter :> HarnessPort
             use _connectionSubscription = adapter.Connections.Subscribe(Observer.onNext (fun status ->
                 Log.write $"opencode event stream: {status}"))
@@ -341,6 +351,7 @@ module Daemon =
                 match kind with
                 | OpenCode -> Some port
                 | ClaudeCode -> Some(claude :> HarnessPort)
+                | Pi -> Some(pi :> HarnessPort)
 
             let observed (event: HarnessEvent) =
                 (match event with
@@ -414,6 +425,11 @@ module Daemon =
                             match evidence with
                             | Ok true -> do! engine.Reconciled(endpoint, mail.Envelope)
                             | _ -> ()
+                        | Uncertain(endpoint, _) when endpoint.Harness = Pi ->
+                            let! evidence = pi.FindAdmission(endpoint, mail.Envelope)
+                            match evidence with
+                            | Ok true -> do! engine.Reconciled(endpoint, mail.Envelope)
+                            | _ -> ()
                         | _ -> ()
                 with error -> Log.write $"admission reconciliation failed: {error.Message}"
                 return! reconciling ()
@@ -421,7 +437,29 @@ module Daemon =
             Async.Start(reconciling ())
 
             let serve (call: Call) = async {
-                if call.Verb = "_claude_register" then
+                if call.Verb = "_pi_register" then
+                    match Field.text "session" call.Input, Field.text "directory" call.Input,
+                          Field.text "token" call.Input, Field.text "socket" call.Input, Field.text "file" call.Input with
+                    | Some session, Some directory, Some token, Some socket, Some file
+                        when (Guid.TryParse(session) |> fst) && token.Length = 32
+                             && (token |> Seq.forall Uri.IsHexDigit)
+                             && Path.IsPathFullyQualified directory && Path.IsPathFullyQualified file
+                             && Path.GetDirectoryName socket = Paths.directory() ->
+                        let endpoint = { Harness = Pi; Session = SessionId session; Scope = Scope(Path.GetFullPath directory) }
+                        let connection = { Endpoint = endpoint; Token = token; Socket = socket; SessionFile = file; Seen = clock.Now() }
+                        if pi.Register connection then
+                            let! intents = engine.Announce endpoint
+                            let! _ = Perform.all ports clock engine intents
+                            let! state = engine.Snapshot()
+                            match RouterState.boundTo endpoint state with
+                            | Some registration -> return ok $"collab: {AgentName.value registration.Name} [{registration.ShortId}]"
+                            | None -> return no "Pi registration was not bound; report this rather than polling."
+                        else return no "Pi transport capacity reached or this session is already open in another Pi process."
+                    | _ -> return no "Invalid Pi runtime registration; persistent native sessions are required."
+                elif call.Verb = "_pi_disconnect" then
+                    call.Metadata |> Option.bind (Field.text "collab.pi/token") |> Option.iter pi.Disconnect
+                    return ok "Pi transport disconnected; its conversation identity is retained."
+                elif call.Verb = "_claude_register" then
                     match Field.text "session" call.Input, Field.text "directory" call.Input,
                           Field.text "token" call.Input, Field.text "socket" call.Input, Field.text "projects" call.Input with
                     | Some session, Some directory, Some token, Some socket, Some projects
@@ -450,12 +488,18 @@ module Daemon =
                     return ok $"Daemon PID: {Environment.ProcessId}\nEvent stream: {adapter.Connection}\nRegistrations: {state.Registrations.Count} ({bound} bound)\nOutbox: {waiting} waiting, {delivering} delivering, {uncertain} uncertain\nDatabase: {Paths.database()}\nAttribution: runtime session metadata required; argument-only matching disabled."
                 else
                     let token = call.Metadata |> Option.bind (Field.text "collab.claude/token")
-                    match token with
-                    | Some token ->
+                    let piToken = call.Metadata |> Option.bind (Field.text "collab.pi/token")
+                    match token, piToken with
+                    | Some _, Some _ -> return no "Conflicting runtime identity metadata. Nothing was done."
+                    | Some token, None ->
                         match claude.Resolve token with
-                        | Some endpoint -> return! dispatch engine attribution ports clock call (Some endpoint) claude.IsConnected
+                        | Some endpoint -> return! dispatch engine attribution ports clock call (Some endpoint) connected
                         | None -> return no "Claude Code channel registration is unavailable. Nothing was done."
-                    | None -> return! dispatch engine attribution ports clock call None claude.IsConnected
+                    | None, Some token ->
+                        match pi.Resolve token with
+                        | Some endpoint -> return! dispatch engine attribution ports clock call (Some endpoint) connected
+                        | None -> return no "Pi extension registration is unavailable. Nothing was done."
+                    | None, None -> return! dispatch engine attribution ports clock call None connected
             }
 
             let rec accepting () =

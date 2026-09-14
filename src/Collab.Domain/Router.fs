@@ -270,7 +270,7 @@ module Router =
             let digest = System.Security.Cryptography.SHA256.HashData(System.Text.Encoding.UTF8.GetBytes session)
             let trees = [| "alder"; "birch"; "cedar"; "elm"; "hazel"; "maple"; "oak"; "pine"; "rowan"; "willow"; "aspen"; "beech"; "fir"; "holly"; "larch"; "spruce" |]
             let animals = [| "badger"; "fox"; "hare"; "heron"; "lynx"; "otter"; "owl"; "panda"; "robin"; "seal"; "stoat"; "swan"; "tiger"; "wolf"; "wren"; "yak" |]
-            let prefix = match endpoint.Harness with OpenCode -> "oc2" | ClaudeCode -> "claude"
+            let prefix = match endpoint.Harness with OpenCode -> "oc2" | ClaudeCode -> "claude" | Pi -> "pi"
             let baseName = prefix + "-" + trees[int digest[0] % trees.Length] + "-" + animals[int digest[1] % animals.Length]
             let rec choose attempt =
                 let raw = if attempt = 0 then baseName else baseName + "-" + string attempt

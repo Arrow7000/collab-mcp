@@ -1,0 +1,8 @@
+{
+  "name": "collab-mcp-pi",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Push collaboration for Pi coding agents through collab-mcp",
+  "type": "module",
+  "pi": { "extensions": ["./index.ts"] }
+}

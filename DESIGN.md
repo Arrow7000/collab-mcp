@@ -106,21 +106,29 @@ protocol. `type: local` servers are spawned **lazily**, but at session start rat
 at first call, and a call made before the server is ready simply blocks. This is what
 lets the shim bootstrap the daemon invisibly.
 
+**F9. Pi supplies native extension hooks.** Pi 0.85.1 provides native session identity
+and startup/shutdown contexts, tools, custom-message rendering, and follow-up delivery
+into its existing TUI. A small extension connects those APIs to the shared daemon.
+Its queued input is volatile until the native custom-message entry is saved, so
+submission alone does not establish delivery. See [Pi findings](docs/findings-pi.md).
+
 ## 5. Architecture
 
 ```
-   agent (any provider)
-        │  send / hello / roster          MCP stdio
-        ▼
-   ┌──────────┐   unix socket   ┌───────────────────────────┐
-   │   shim   │ ──────────────▶ │        router daemon      │
-   └──────────┘   (spawns it    │  registry · queue · limits│
-                   if absent)   └───────────┬───────────────┘
-                                            │ HarnessPort
-                              ┌─────────────┴─────────────┐
-                              ▼                           ▼
-                     opencode adapter            claude-code adapter
-                   (SSE events, synthetic)        (socket, env ident)
+   OC2 / Claude agents                  Pi agent
+          │ MCP                            │ native extension
+          ▼                                ▼
+     stdio shim                       native stdio bridge
+          └─────────────────┬───────────────┘
+                            │ local Unix socket (starts daemon if absent)
+                            ▼
+                       router daemon
+                 registry · outbox · limits
+                            │ HarnessPort
+               ┌────────────┼────────────────┐
+               ▼            ▼                ▼
+             OC2          Claude             Pi
+         SSE/synthetic  MCP channels   native custom messages
 ```
 
 **Router daemon** — the only long-lived component. Owns the event subscriptions, the
@@ -177,7 +185,8 @@ flushes when a session claims the name.
 
 **The router does not track turn boundaries.** Every harness we support implements that
 itself: opencode chooses between `queue` and `steer` internally, and Claude Code
-delivers between tool calls or starts a new turn. Modelling turn state in the router
+delivers between tool calls or starts a new turn. Pi queues native follow-ups or
+starts an idle turn. Modelling turn state in the router
 would duplicate the runtime and get it subtly wrong, so `HarnessEvent` carries no
 "went idle" case.
 
@@ -187,10 +196,13 @@ would duplicate the runtime and get it subtly wrong, so `HarnessEvent` carries n
 harness reports session creation, viewing, or execution and the project's `collab` MCP
 server is connected. The default peer name uses a harness prefix plus two session-derived words, such as
 `oc2-maple-otter`; collisions with live names/aliases get a numeric suffix. The
-prefix is `oc2-` for OpenCode and `claude-` for the domain's ClaudeCode harness.
+prefix is `oc2-` for OpenCode, `claude-` for Claude Code, and `pi-` for Pi.
 ClaudeCode presence is registered after its per-session MCP handshake, without a
 model call. The shim validates `clientInfo.name = claude-code` and uses only native
 environment identity; tool arguments and caller `_meta` cannot override it.
+Pi announces through its extension's native startup context and displays its name
+and short ID in the TUI status line. Its runtime-generated token scopes native tool
+calls independently of their model-visible arguments.
 This does not enumerate historical conversations, execute model work, or wake an idle
 session. A scoped `roster`/`send` call also repairs a missed lifecycle registration.
 
@@ -248,13 +260,21 @@ no `from`: the router resolves the sender from the session that made the call.
 **Scope is derived, never configured.** A name is unique within a project, not across
 the machine, so two unrelated repositories cannot collide on `RedStone`. The project
 comes from the harness: opencode puts `location.directory` on every event, and Claude
-Code exports `CLAUDE_PROJECT_DIR` to the servers it spawns. There is no workspace to
+Code exports `CLAUDE_PROJECT_DIR` to the servers it spawns; Pi derives it from native
+`ctx.cwd`. There is no workspace to
 create, name or enumerate — agents working the same directory are peers, and an event
 that arrives without a location is dropped rather than guessed at, since an unscoped
 endpoint would silently merge every project into one namespace.
 
 Binding `name → endpoint`:
 
+- **Pi**: native extension context supplies session ID, directory, and saved-session
+  path. A private leased socket accepts custom peer messages; the native bridge
+  forwards tools with a runtime-generated identity token. `followUp` preserves
+  turn-boundary ordering and wakes idle sessions. The exact native custom-message
+  entry and matching session header establish admission; submitted mail otherwise
+  remains owned and unretried. Reload and resume retain identity; a new conversation
+  gets a distinct ID. `Interrupt` is explicitly refused.
 - **Claude Code**: read `CLAUDE_CODE_SESSION_ID` and `CLAUDE_PROJECT_DIR` from the
   shim's environment. Direct; no correlation needed. A private, leased per-session
   socket bridges the daemon to the stdio channel pipe. The same router and SQLite
@@ -426,6 +446,13 @@ externally triggered work in the same open session.
 
 ### M4 — cross-harness collaboration
 
+- [x] Verify and implement Pi's native extension behind the shared harness boundary:
+  automatic native identity, custom peer messages, idle wake-up, busy follow-ups,
+  explicit unsupported interrupt, and native session receipts.
+- [x] Demonstrate bidirectional Pi/OC2 messaging with both real TUIs open.
+- [ ] Verify Grok Build's leader/ACP session attachment, reliable caller attribution,
+  independent-peer provenance, and native admission evidence before adding an adapter.
+  See [the feasibility investigation](docs/findings-grok-build.md).
 - [x] Verify Claude Code's channel transport against its installed version, including
   opt-in, receipt semantics, terminal visibility, and unsupported interrupt behaviour.
 - [ ] Verify Codex's shared app-server/thread transport, external-input rendering,
@@ -445,6 +472,20 @@ delivery contract; unsupported urgency must be explicit.
 - [ ] Demonstrate two peers coordinating shared edits and recovering from a dead owner.
 
 ### Evidence
+
+- 2026-09-14: Pi 0.85.1 adapter implemented as a native extension with the same
+  three tools and daemon/core as MCP harnesses. Two real Pi TUIs verified automatic
+  presence before any model call, stable IDs, rename aliases, idle wake-up and
+  streaming, busy follow-up ordering, interrupt refusal, and native close/resume
+  continuity. Installed-package discovery, `/reload`, and `/new` also passed native
+  lifecycle checks. Real Pi/OC2 TUIs verified both delivery directions with positive
+  native receipts. All 145 Release tests pass; the Pi extension passes strict
+  TypeScript checking and the latest OC2 identity and Claude/OC2 regressions pass.
+  The local Pi package is installed; the updated daemon preserves all five existing
+  identities and bindings with an empty outbox and a private state backup.
+  See [Pi findings](docs/findings-pi.md).
+  Grok Build source review identifies leader/ACP as a promising next integration;
+  independent-peer ingress and attribution still require live verification.
 
 - 2026-09-14: Claude Code 2.1.270 adapter implemented using native per-session
   attribution and opt-in MCP channels. Real Claude/OC2 TUIs verified automatic

@@ -61,7 +61,7 @@ module Mcp =
         "urgency": {
           "type": "string",
           "enum": ["at_turn_boundary", "interrupt"],
-          "description": "at_turn_boundary, the default, lets the recipient finish what it is doing first. interrupt cuts into OC2 work immediately; Claude Code recipients refuse interrupt. Use it only when the recipient must stop, such as when it is about to conflict with you."
+          "description": "at_turn_boundary, the default, lets the recipient finish what it is doing first. interrupt cuts into OC2 work immediately; Claude Code and Pi recipients refuse interrupt. Use it only when the recipient must stop, such as when it is about to conflict with you."
         }
       },
       "required": ["to", "body"]

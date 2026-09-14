@@ -403,6 +403,8 @@ type OpenCodeAdapter private (client: OpenCodeClient, ownsClient: bool) =
             async {
                 match endpoint.Harness with
                 | HarnessKind.ClaudeCode ->
+                    return Error(HarnessRejected(0, "endpoint is not an opencode session"))
+                | HarnessKind.Pi ->
                     // A routing bug, not a harness failure. Status 0 says no request
                     // was made: there is no HTTP exchange to report.
                     return Error(HarnessRejected(0, "endpoint is not an opencode session"))
