@@ -20,8 +20,9 @@ type Refusal =
     | QueueFull of detail: string
     /// Another live session already owns this name in the project.
     | NameInUse of AgentName
-    /// A session has one name; a later hello cannot silently change its sender identity.
+    /// ID-shaped addresses cannot be claimed as display names.
     | ReservedName of AgentName
+    | UnknownPeerAddress of AgentName
     | UnknownPeerId of PeerId
     | AliasLimit of AgentName
 

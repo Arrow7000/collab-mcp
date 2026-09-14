@@ -115,6 +115,25 @@ module PeerId =
         let bytes = System.Security.Cryptography.SHA256.HashData(System.Text.Encoding.UTF8.GetBytes raw)
         PeerId(Guid(bytes[0..15]))
 
+/// Compact public address; the full PeerId remains the durable identity underneath.
+module PeerAddress =
+    let tryParse (raw: string) =
+        if not (isNull raw) && raw.Length = 13 && raw.StartsWith("peer-", StringComparison.OrdinalIgnoreCase) &&
+           raw.Substring(5) |> Seq.forall Uri.IsHexDigit then Some(raw.ToLowerInvariant())
+        else None
+
+    /// The caller supplies all reserved addresses/names, including inactive peers.
+    let allocate (candidate: unit -> string) (reserved: Set<string>) =
+        let rec next () =
+            let address = candidate ()
+            match tryParse address with
+            | None -> invalidArg "candidate" "expected peer- followed by eight hexadecimal digits"
+            | Some address when Set.contains address reserved -> next ()
+            | Some address -> address
+        next ()
+
+    let random () = "peer-" + Guid.NewGuid().ToString("N").Substring(0, 8)
+
 module Scope =
 
     /// Harness directories are absolute. Normalize syntax but preserve case so distinct

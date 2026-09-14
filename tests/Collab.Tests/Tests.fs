@@ -101,7 +101,7 @@ let ``session deletion releases every legacy alias and leaves peers alone`` () =
     let state = claimed red a
     let state, _ = Router.claim now blue b state
     let alias = name "LegacyAlias"
-    let registration = { Id = PeerId.create(); Aliases = []; Name = alias; Scope = a.Scope; Binding = Bound(a, now); FirstSeen = now }
+    let registration = { Id = PeerId.create(); ShortId = PeerAddress.random (); Aliases = []; Name = alias; Scope = a.Scope; Binding = Bound(a, now); FirstSeen = now }
     let legacy =
         { state with Registrations = Map.add (RouterState.key a.Scope alias) registration state.Registrations }
     let state', intents = Router.observe (SessionEnded a) legacy

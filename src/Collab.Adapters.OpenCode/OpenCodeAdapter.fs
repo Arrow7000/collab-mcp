@@ -97,15 +97,15 @@ module Mapping =
         let sender = AgentName.value envelope.From
         let (MessageId id) = envelope.Id
 
-        let fromPeer = if envelope.LegacyFormat then None else envelope.FromPeer
+        let fromPeer = if envelope.LegacyFormat then None else envelope.FromAddress |> Option.orElse (envelope.FromPeer |> Option.map PeerId.value)
         { Id = Some("msg_" + id.ToString "N")
           Text =
               match fromPeer with
               | None -> $"[peer {sender}]: {envelope.Body}"
-              | Some peer -> $"[peer {sender} · {PeerId.value peer}]: {envelope.Body}\n\nReply address: {PeerId.value peer}. This ID stays the same across name changes."
+              | Some peer -> $"[peer {sender} · {peer}]: {envelope.Body}\n\nReply address: {peer}. This ID stays the same across name changes."
           Description = Some(match fromPeer with
                              | None -> $"peer message from {sender}"
-                             | Some peer -> $"peer message from {sender} [{PeerId.value peer}]")
+                             | Some peer -> $"peer message from {sender} [{peer}]")
           Delivery = delivery envelope.Urgency }
 
     /// A session id from the bus is an opencode endpoint by construction: this is the

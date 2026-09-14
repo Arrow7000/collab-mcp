@@ -5,6 +5,7 @@ open System
 
 type Registration =
     { Id: PeerId
+      ShortId: string
       Aliases: AgentName list
       Name: AgentName
       Scope: Scope
@@ -63,6 +64,9 @@ module RouterState =
     let lookup (scope: Scope) (name: AgentName) (state: RouterState) =
         match PeerId.tryParse (AgentName.value name) with
         | Some id -> byId scope id state
+        | None when PeerAddress.tryParse (AgentName.value name) |> Option.isSome ->
+            state.Registrations |> Map.toSeq |> Seq.map snd
+            |> Seq.tryFind (fun r -> r.ShortId = (AgentName.value name).ToLowerInvariant() && Scope.key r.Scope = Scope.key scope)
         | None ->
             state.Registrations |> Map.toSeq |> Seq.map snd
             |> Seq.filter (fun r -> Scope.key r.Scope = Scope.key scope && ownsName name r)
@@ -160,7 +164,7 @@ module Router =
             |> Seq.tryFind (fun r ->
                 Scope.key r.Scope = Scope.key endpoint.Scope && Binding.isLive r.Binding && RouterState.ownsName name r)
         let current = RouterState.boundTo endpoint state
-        if PeerId.tryParse(AgentName.value name) |> Option.isSome then state, [ Decline(ReservedName name) ]
+        if (PeerId.tryParse(AgentName.value name) |> Option.isSome) || (PeerAddress.tryParse(AgentName.value name) |> Option.isSome) then state, [ Decline(ReservedName name) ]
         elif occupied |> Option.exists (fun owner -> current |> Option.forall (fun self -> self.Id <> owner.Id)) then
             state, [ Decline(NameInUse name) ]
         else
@@ -171,7 +175,13 @@ module Router =
                     let aliases = r.Name :: r.Aliases |> List.filter (AgentName.equivalent name >> not) |> List.distinctBy AgentName.key
                     { r with Name = name; Aliases = aliases }
                 | None ->
-                    { Id = PeerId.create(); Name = name; Aliases = []; Scope = endpoint.Scope
+                    let reserved = state.Registrations |> Map.toSeq |> Seq.map snd |> Seq.collect (fun r ->
+                        seq { yield r.ShortId; yield AgentName.key r.Name; yield! r.Aliases |> Seq.map AgentName.key }) |> Set.ofSeq
+                    let shortId = PeerAddress.allocate PeerAddress.random reserved
+                    let rec uniqueId () =
+                        let id = PeerId.create()
+                        if state.Registrations |> Map.exists (fun _ r -> r.Id = id) then uniqueId () else id
+                    { Id = uniqueId (); ShortId = shortId; Name = name; Aliases = []; Scope = endpoint.Scope
                       Binding = Bound(endpoint, now); FirstSeen = now }
             if registration.Aliases.Length > 64 then state, [ Decline(AliasLimit name) ]
             else
@@ -190,6 +200,8 @@ module Router =
         let mailboxPeers = peers |> List.filter (forAddress scope request.To state) |> List.length
         let self = match sender, recipient with Some a, Some b -> a.Id = b.Id | _ -> AgentName.equivalent from request.To
         if self then state, [ Decline(SelfAddressed request.To) ]
+        elif recipient.IsNone && (PeerAddress.tryParse(AgentName.value request.To) |> Option.isSome) then
+            state, [ Decline(UnknownPeerAddress request.To) ]
         elif recipient.IsNone && (PeerId.tryParse(AgentName.value request.To) |> Option.isSome) then
             state, [ Decline(UnknownPeerId(PeerId.tryParse(AgentName.value request.To) |> Option.get)) ]
         elif bytes > limits.MaxBodyBytes then state, [ Decline(MessageTooLarge(bytes, limits.MaxBodyBytes)) ]
@@ -202,6 +214,7 @@ module Router =
             let envelope =
                 { Envelope.seal from now request with
                     FromPeer = sender |> Option.map _.Id
+                    FromAddress = sender |> Option.map _.ShortId
                     ToPeer = recipient |> Option.map _.Id }
             let until = now + limits.ParkWindow
             let mail =
@@ -221,9 +234,17 @@ module Router =
         | None ->
             let (SessionId session) = endpoint.Session
             let digest = System.Security.Cryptography.SHA256.HashData(System.Text.Encoding.UTF8.GetBytes session)
-            let raw = "oc2-" + Convert.ToHexString(digest).ToLowerInvariant().Substring(0, 16)
-            let name = AgentName.create raw |> Result.defaultWith (fun e -> failwithf "%A" e)
-            claim now name endpoint state
+            let trees = [| "alder"; "birch"; "cedar"; "elm"; "hazel"; "maple"; "oak"; "pine"; "rowan"; "willow"; "aspen"; "beech"; "fir"; "holly"; "larch"; "spruce" |]
+            let animals = [| "badger"; "fox"; "hare"; "heron"; "lynx"; "otter"; "owl"; "panda"; "robin"; "seal"; "stoat"; "swan"; "tiger"; "wolf"; "wren"; "yak" |]
+            let prefix = match endpoint.Harness with OpenCode -> "oc2" | ClaudeCode -> "claude"
+            let baseName = prefix + "-" + trees[int digest[0] % trees.Length] + "-" + animals[int digest[1] % animals.Length]
+            let rec choose attempt =
+                let raw = if attempt = 0 then baseName else baseName + "-" + string attempt
+                let name = AgentName.create raw |> Result.defaultWith (fun e -> failwithf "%A" e)
+                let taken = state.Registrations |> Map.toSeq |> Seq.map snd |> Seq.exists (fun r ->
+                    Scope.key r.Scope = Scope.key endpoint.Scope && Binding.isLive r.Binding && RouterState.ownsName name r)
+                if taken then choose (attempt + 1) else name
+            claim now (choose 0) endpoint state
 
     let observe (event: HarnessEvent) (state: RouterState) =
         match event with

@@ -66,6 +66,7 @@ module Daemon =
         | SelfAddressed name -> $"you addressed yourself ({AgentName.value name})"
         | NameInUse name -> $"the name '{AgentName.value name}' is already owned by another session in this project; choose a different name"
         | ReservedName name -> $"'{AgentName.value name}' is reserved for peer IDs; choose a display name"
+        | UnknownPeerAddress address -> $"no peer with ID '{AgentName.value address}' exists in this project"
         | UnknownPeerId id -> $"no peer with ID '{PeerId.value id}' exists in this project"
         | AliasLimit _ -> "this peer already retains 64 previous names; its name was not changed"
 
@@ -104,7 +105,7 @@ module Daemon =
                     match registration.Aliases with
                     | [] -> ""
                     | aliases -> " (previous names: " + (aliases |> List.map AgentName.value |> String.concat ", ") + ")"
-                $"  {name} [{PeerId.value registration.Id}]{mine}{previous}{live}"
+                $"  {name} [{registration.ShortId}]{mine}{previous}{live}"
 
             let listing = view.Everyone |> List.map line |> String.concat "\n"
 
@@ -188,9 +189,11 @@ module Daemon =
                                         if List.isEmpty outcomes then ""
                                         else $" Backlog: {delivered} admitted, {held} still held, {failed} failed or uncertain."
 
+                                    let! view = engine.Roster endpoint
+                                    let id = view.Caller |> Option.map _.ShortId |> Option.defaultValue "unavailable"
                                     return
                                         ok
-                                            $"You are known as {AgentName.value claimedName} in {directoryOf endpoint}. Peers can now reach you, and their messages arrive on their own — there is nothing to check.{backlog}"
+                                            $"You are known as {AgentName.value claimedName} [{id}] in {directoryOf endpoint}. Peers can now reach you, and their messages arrive on their own — there is nothing to check.{backlog}"
 
                 | Verbs.Roster ->
                     match! resolve () with

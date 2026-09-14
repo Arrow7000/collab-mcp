@@ -323,3 +323,33 @@ let ``claiming an unresolved recipient as own name returns failure instead of se
     equal FailureNotice mail.Purpose
     equal (RouterState.boundTo a state |> Option.map _.Id) mail.Envelope.ToPeer
     Assert.Contains(intents, fun intent -> match intent with PushTo(endpoint, envelope) -> endpoint = a && envelope = mail.Envelope | _ -> false)
+
+[<Fact>]
+let ``compact IDs route to the same durable peer and cannot become names`` () =
+    let peer = (RouterState.boundTo b both).Value
+    equal 13 peer.ShortId.Length
+    equal (Some peer) (RouterState.lookup b.Scope (name(peer.ShortId.ToUpperInvariant())) both)
+    let state, _ = Router.send now Limits.defaults a.Scope red { request "compact" with To = name peer.ShortId } both
+    equal (Some peer.Id) state.Pending.Head.Envelope.ToPeer
+    equal (Some (RouterState.boundTo a both).Value.ShortId) state.Pending.Head.Envelope.FromAddress
+    equal [ Decline(ReservedName(name peer.ShortId)) ] (Router.claim now (name peer.ShortId) a both |> snd)
+    equal [ Decline(UnknownPeerAddress(name "peer-00000000")) ] (Router.send now Limits.defaults a.Scope red { request "unknown" with To = name "peer-00000000" } senderOnly |> snd)
+
+[<Fact>]
+let ``compact ID allocator retries a collision before returning`` () =
+    let mutable calls = 0
+    let candidate () =
+        calls <- calls + 1
+        if calls < 3 then "peer-12345678" else "peer-87654321"
+    equal "peer-87654321" (PeerAddress.allocate candidate (Set.singleton "peer-12345678"))
+    equal 3 calls
+
+[<Fact>]
+let ``automatic readable names avoid names already owned in the directory`` () =
+    let initial = Router.announce now a RouterState.empty |> fst
+    let generated = (RouterState.boundTo a initial).Value.Name
+    Assert.Matches("^oc2-[a-z]+-[a-z]+$", AgentName.value generated)
+    let occupied = Router.claim now generated b RouterState.empty |> fst
+    let state, _ = Router.announce now a occupied
+    equal (AgentName.value generated + "-1") (AgentName.value (RouterState.boundTo a state).Value.Name)
+    equal generated (RouterState.boundTo b state).Value.Name

@@ -86,7 +86,7 @@ let ``failed persistence rejects acknowledgement and leaves the engine responsiv
 
 [<Fact>]
 let ``unsupported state versions fail explicitly`` () =
-    Assert.ThrowsAny<Exception>(fun () -> StateWire.decode "{\"version\":3}" |> ignore) |> ignore
+    Assert.ThrowsAny<Exception>(fun () -> StateWire.decode "{\"version\":4}" |> ignore) |> ignore
 
 [<Fact>]
 let ``positive admission reconciliation is durable and matches the endpoint`` () = withDatabase (fun path ->
@@ -146,7 +146,7 @@ let ``legacy migration pins identities without changing admitted wire text`` () 
     Assert.True pinned.FromPeer.IsSome
     Assert.True pinned.ToPeer.IsSome
     Assert.True pinned.LegacyFormat
-    let oldWire = Collab.Adapters.OpenCode.Mapping.render { original with FromPeer = None; ToPeer = None }
+    let oldWire = Collab.Adapters.OpenCode.Mapping.render { original with FromPeer = None; FromAddress = None; ToPeer = None }
     let newWire = Collab.Adapters.OpenCode.Mapping.render pinned
     equal oldWire newWire
 
@@ -172,7 +172,7 @@ let ``sqlite atomically upgrades a legacy snapshot and persists assigned IDs`` (
     use command = connection.CreateCommand()
     command.CommandText <- "SELECT payload FROM state WHERE id=1"
     let root = System.Text.Json.Nodes.JsonNode.Parse(command.ExecuteScalar() :?> string)
-    equal 2 (root["version"].GetValue<int>()))
+    equal 3 (root["version"].GetValue<int>()))
 
 [<Fact>]
 let ``renamed identity and aliases survive engine restart`` () = withDatabase (fun path ->
@@ -189,3 +189,41 @@ let ``renamed identity and aliases survive engine restart`` () = withDatabase (f
     equal (name "Crimson") renamed.Name
     equal (Some renamed) (RouterState.lookup a.Scope (name "Red") snapshot)
     equal (Some renamed) (RouterState.byId a.Scope original.Id snapshot))
+
+[<Fact>]
+let ``version two migration preserves full IDs and already submitted message text`` () =
+    let state = Router.claim now (name "Red") a RouterState.empty |> fst
+    let state, _ = Router.send now Limits.defaults a.Scope (name "Red") { To = name "Blue"; Body = "old text"; Urgency = AtTurnBoundary } state
+    let root = System.Text.Json.Nodes.JsonNode.Parse(StateWire.encode state)
+    root["version"] <- System.Text.Json.Nodes.JsonValue.Create 2
+    for r in root["registrations"].AsArray() do r.AsObject().Remove("shortId") |> ignore
+    for m in root["pending"].AsArray() do m["envelope"].AsObject().Remove("fromAddress") |> ignore
+    let migrated = StateWire.decode(root.ToJsonString())
+    let again = StateWire.decode(root.ToJsonString())
+    equal migrated again
+    let peer = (RouterState.boundTo a migrated).Value
+    equal (RouterState.boundTo a state).Value.Id peer.Id
+    equal (Some peer) (RouterState.lookup a.Scope (name peer.ShortId) migrated)
+    equal (Some peer) (RouterState.byId a.Scope peer.Id migrated)
+    let oldEnvelope = { state.Pending.Head.Envelope with FromAddress = None }
+    equal (Collab.Adapters.OpenCode.Mapping.render oldEnvelope) (Collab.Adapters.OpenCode.Mapping.render migrated.Pending.Head.Envelope)
+    equal migrated (StateWire.decode(StateWire.encode migrated))
+
+[<Fact>]
+let ``migration resolves matching ID prefixes and rejects duplicate stored short IDs`` () =
+    let state = Router.claim now (name "Red") a RouterState.empty |> fst |> Router.claim now (name "Blue") b |> fst
+    let root = System.Text.Json.Nodes.JsonNode.Parse(StateWire.encode state)
+    root["version"] <- System.Text.Json.Nodes.JsonValue.Create 2
+    let nodes = root["registrations"].AsArray()
+    nodes[0]["peerId"] <- System.Text.Json.Nodes.JsonValue.Create "peer-12345678000000000000000000000001"
+    nodes[1]["peerId"] <- System.Text.Json.Nodes.JsonValue.Create "peer-12345678000000000000000000000002"
+    for node in nodes do node.AsObject().Remove("shortId") |> ignore
+    let migrated = StateWire.decode(root.ToJsonString())
+    let addresses = migrated.Registrations |> Map.toList |> List.map (snd >> _.ShortId)
+    equal 2 (Set.ofList addresses |> Set.count)
+    Assert.Contains("peer-12345678", addresses)
+    equal migrated (StateWire.decode(root.ToJsonString()))
+    let invalid = System.Text.Json.Nodes.JsonNode.Parse(StateWire.encode migrated)
+    let duplicate = invalid["registrations"].AsArray()[1]
+    duplicate["shortId"] <- System.Text.Json.Nodes.JsonValue.Create addresses.Head
+    Assert.ThrowsAny<Exception>(fun () -> StateWire.decode(invalid.ToJsonString()) |> ignore) |> ignore

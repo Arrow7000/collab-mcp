@@ -28,6 +28,7 @@ type Envelope =
     { Id: MessageId
       LegacyFormat: bool
       FromPeer: PeerId option
+      FromAddress: string option
       ToPeer: PeerId option
       From: AgentName
       To: AgentName
@@ -61,6 +62,7 @@ module Envelope =
         { Id = MessageId(Guid.NewGuid())
           LegacyFormat = false
           FromPeer = None
+          FromAddress = None
           ToPeer = None
           From = from
           To = request.To
@@ -82,6 +84,7 @@ module Envelope =
         { Id = MessageId(Guid.NewGuid())
           LegacyFormat = false
           FromPeer = envelope.FromPeer
+          FromAddress = envelope.FromAddress
           ToPeer = envelope.FromPeer
           From = envelope.From
           To = envelope.From

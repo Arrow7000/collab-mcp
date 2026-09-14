@@ -184,7 +184,10 @@ would duplicate the runtime and get it subtly wrong, so `HarnessEvent` carries n
 
 **Automatic presence, optional explicit naming.** OC2 sessions are registered when the
 harness reports session creation, viewing, or execution and the project's `collab` MCP
-server is connected. The default peer name is `oc2-` plus a stable session-derived hash.
+server is connected. The default peer name uses a harness prefix plus two session-derived words, such as
+`oc2-maple-otter`; collisions with live names/aliases get a numeric suffix. The
+prefix is `oc2-` for OpenCode and `claude-` for the domain's ClaudeCode harness.
+ClaudeCode presence is not yet implemented by an adapter.
 This does not enumerate historical conversations, execute model work, or wake an idle
 session. A scoped `roster`/`send` call also repairs a missed lifecycle registration.
 
@@ -211,8 +214,12 @@ Session deletion releases names, but a genuinely new session gets a new ID and c
 inherit mail pinned to the old peer. Missing/deleted-session reconciliation remains
 required recovery work.
 
-Version-1 persisted registrations migrate atomically to version 2 with deterministic
-IDs. Legacy pending messages retain their exact original rendered text so reconciliation
+Version-1 persisted registrations receive deterministic full IDs. Versions 1 and 2
+migrate atomically to version 3, adding a persisted `peer-` plus eight-hex-digit public
+address without changing full IDs or names. Full IDs remain accepted addresses.
+Short addresses are reserved across all stored peers, including inactive peers; new
+allocation retries collisions and also checks names/aliases. The full ID is checked
+for collision before insertion as well. Legacy pending messages retain their exact original rendered text so reconciliation
 can still identify an already admitted message; newly created messages carry IDs.
 
 **Nothing about an agent's identity or location is taken from the agent.** An agent
@@ -398,6 +405,12 @@ delivery contract; unsupported urgency must be explicit.
 - [ ] Demonstrate two peers coordinating shared edits and recovering from a dead owner.
 
 ### Evidence
+
+- 2026-09-14: compact eight-hex-digit public peer IDs with collision retry, backward
+  compatible full-ID addressing, and readable generated names implemented. Migration
+  preserves identity and the exact text of already submitted messages. All 104 tests
+  pass in Debug and Release; real OC2 identity and bootstrap checks pass. The live
+  migration preserved every existing name and full ID and assigned unique short IDs.
 
 - 2026-09-14: durable peer IDs, safe renaming, reserved aliases, and name/ID addressing
   implemented. SQLite migration and restart preserve identity. Real OC2 verifies that

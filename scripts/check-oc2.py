@@ -38,7 +38,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
   if args.mode=='identity' and body['messages'][-1]['role']=='user':
    code=None
    if 'identity rename' in lastUser:code='return await tools.collab.hello({name:"Crimson"})'
-   if 'identity send' in lastUser:code='return await Promise.all([tools.collab.send({to:"Red",body:"alias payload"}),tools.collab.send({to:'+json.dumps(identityTarget)+',body:"ID payload"})])'
+   if 'identity send' in lastUser:code='return await Promise.all([tools.collab.send({to:"Red",body:"alias payload"}),tools.collab.send({to:'+json.dumps(identityAddress)+',body:"ID payload"})])'
    if code:
     msg={'role':'assistant','content':None,'tool_calls':[{'id':'probe_'+str(len(requests)),'type':'function','function':{'name':'execute','arguments':json.dumps({'code':code})}}]};finish='tool_calls'
   if body.get('stream'):
@@ -149,7 +149,7 @@ try:
   def stateSnapshot():
    with sqlite3.connect('file:'+env['COLLAB_MCP_HOME']+'/state.sqlite?mode=ro',uri=True) as db:
     return json.loads(db.execute('SELECT payload FROM state WHERE id=1').fetchone()[0])
-  initial=stateSnapshot()['registrations'][0];identityTarget=initial['peerId']
+  initial=stateSnapshot()['registrations'][0];identityTarget=initial['peerId'];identityAddress=initial['shortId']
   api('POST',f'/api/session/{session}/prompt',{'text':'identity rename'})
   for _ in range(100):
    renamed=next((r for r in stateSnapshot()['registrations'] if r['peerId']==identityTarget),None)
@@ -168,7 +168,7 @@ try:
    if 'alias payload' in messages and 'ID payload' in messages:break
    time.sleep(.1)
   assert 'alias payload' in messages and 'ID payload' in messages,'messages did not reach renamed peer'
-  assert sender['peerId'] in messages,'sender ID missing in received message'
+  assert sender['shortId'] in messages,'sender ID missing in received message'
   assert renamed['peerId']==initial['peerId'],'rename changed identity'
   print('Rename retained peer ID; old-name and ID sends reached the same peer with sender ID: passed.')
  if os.environ.get('PROBE_TUI')=='1':
