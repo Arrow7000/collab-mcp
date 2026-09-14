@@ -218,7 +218,12 @@ Version-1 persisted registrations receive deterministic full IDs. Versions 1–3
 migrate atomically to version 4, exposing a persisted eight-hex-digit public address
 without changing full IDs or names. Earlier prefixed short addresses and full IDs
 remain accepted. Already submitted message text stays unchanged; new messages show
-bare hex IDs. Eight-character hex strings are reserved for ID addressing.
+bare hex IDs. Eight-character hex strings are reserved for new ID addressing.
+Legacy address-shaped names and aliases still resolve where unambiguous, including
+idempotent hello and restoring an owned alias. A name and ID identifying different
+registrations is refused as ambiguous; migration detects that conflict before saving.
+Actor identity comes from the endpoint-bound registration, not address parsing.
+New ID allocation reserves normalized forms of legacy names and aliases.
 Short addresses are reserved across all stored peers, including inactive peers; new
 allocation retries collisions and also checks names/aliases. The full ID is checked
 for collision before insertion as well. Legacy pending messages retain their exact original rendered text so reconciliation
@@ -312,7 +317,7 @@ the resulting activity. Backend transcript checks alone are insufficient.
   Repeating hello with the same name is idempotent and preserves displayed spelling;
   renaming preserves the peer ID and reserves previous names as aliases. Another
   live owner blocks a claim. A new session may reuse released names with a new ID.
-- [ ] Preserve legacy address-shaped names/aliases during migration; prevent sender
+- [x] Preserve legacy address-shaped names/aliases during migration; prevent sender
   provenance loss when a preserved name matches ID syntax. See the
   [adversarial review](docs/adversarial-review-2026-09-14.md).
 - [x] Add durable peer IDs, safe renaming, and addressing by ID or reserved alias;

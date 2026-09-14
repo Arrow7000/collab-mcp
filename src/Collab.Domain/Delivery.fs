@@ -22,6 +22,7 @@ type Refusal =
     | NameInUse of AgentName
     /// ID-shaped addresses cannot be claimed as display names.
     | ReservedName of AgentName
+    | AmbiguousAddress of AgentName
     | UnknownPeerAddress of AgentName
     | UnknownPeerId of PeerId
     | AliasLimit of AgentName

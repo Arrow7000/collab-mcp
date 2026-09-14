@@ -61,17 +61,28 @@ module RouterState =
     let byId (scope: Scope) (id: PeerId) (state: RouterState) =
         state.Registrations |> Map.toSeq |> Seq.map snd
         |> Seq.tryFind (fun r -> r.Id = id && Scope.key r.Scope = Scope.key scope)
-    let lookup (scope: Scope) (name: AgentName) (state: RouterState) =
-        match PeerId.tryParse (AgentName.value name) with
-        | Some id -> byId scope id state
-        | None when PeerAddress.tryParse (AgentName.value name) |> Option.isSome ->
-            state.Registrations |> Map.toSeq |> Seq.map snd
-            |> Seq.tryFind (fun r -> Some r.ShortId = PeerAddress.tryParse (AgentName.value name) && Scope.key r.Scope = Scope.key scope)
-        | None ->
-            state.Registrations |> Map.toSeq |> Seq.map snd
-            |> Seq.filter (fun r -> Scope.key r.Scope = Scope.key scope && ownsName name r)
-            |> Seq.sortByDescending (fun r -> Binding.isLive r.Binding, r.FirstSeen)
-            |> Seq.tryHead
+    /// Names and IDs are separate namespaces; legacy names may resemble ID syntax.
+    let byName scope name state =
+        state.Registrations |> Map.toSeq |> Seq.map snd
+        |> Seq.filter (fun r -> Scope.key r.Scope = Scope.key scope && ownsName name r)
+        |> Seq.sortByDescending (fun r -> Binding.isLive r.Binding, r.FirstSeen)
+        |> Seq.tryHead
+    let resolve scope name state =
+        let named = byName scope name state
+        let addressed =
+            match PeerId.tryParse (AgentName.value name) with
+            | Some id -> byId scope id state
+            | None ->
+                match PeerAddress.tryParse (AgentName.value name) with
+                | None -> None
+                | Some address ->
+                    state.Registrations |> Map.toSeq |> Seq.map snd
+                    |> Seq.tryFind (fun r -> r.ShortId = address && Scope.key r.Scope = Scope.key scope)
+        match named, addressed with
+        | Some a, Some b when a.Id <> b.Id -> Error(AmbiguousAddress name)
+        | Some registration, _ | _, Some registration -> Ok(Some registration)
+        | None, None -> Ok None
+    let lookup scope name state = resolve scope name state |> Result.toOption |> Option.flatten
     let boundTo (endpoint: Endpoint) (state: RouterState) =
         state.Registrations |> Map.toSeq |> Seq.map snd
         |> Seq.tryFind (fun r -> Binding.endpoint r.Binding = Some endpoint)
@@ -164,7 +175,8 @@ module Router =
             |> Seq.tryFind (fun r ->
                 Scope.key r.Scope = Scope.key endpoint.Scope && Binding.isLive r.Binding && RouterState.ownsName name r)
         let current = RouterState.boundTo endpoint state
-        if (PeerId.tryParse(AgentName.value name) |> Option.isSome) || (PeerAddress.tryParse(AgentName.value name) |> Option.isSome) then state, [ Decline(ReservedName name) ]
+        let retained = current |> Option.exists (RouterState.ownsName name)
+        if not retained && ((PeerId.tryParse(AgentName.value name) |> Option.isSome) || (PeerAddress.tryParse(AgentName.value name) |> Option.isSome)) then state, [ Decline(ReservedName name) ]
         elif occupied |> Option.exists (fun owner -> current |> Option.forall (fun self -> self.Id <> owner.Id)) then
             state, [ Decline(NameInUse name) ]
         else
@@ -176,11 +188,17 @@ module Router =
                     { r with Name = name; Aliases = aliases }
                 | None ->
                     let reserved = state.Registrations |> Map.toSeq |> Seq.map snd |> Seq.collect (fun r ->
-                        seq { yield r.ShortId; yield AgentName.key r.Name; yield! r.Aliases |> Seq.map AgentName.key }) |> Set.ofSeq
+                        seq {
+                            yield r.ShortId
+                            for n in r.Name :: r.Aliases do
+                                yield AgentName.key n
+                                yield! PeerAddress.tryParse(AgentName.value n) |> Option.toList }) |> Set.ofSeq
                     let shortId = PeerAddress.allocate PeerAddress.random reserved
                     let rec uniqueId () =
                         let id = PeerId.create()
-                        if state.Registrations |> Map.exists (fun _ r -> r.Id = id) then uniqueId () else id
+                        let taken = state.Registrations |> Map.exists (fun _ r ->
+                            r.Id = id || (r.Name :: r.Aliases |> List.exists (fun n -> PeerId.tryParse(AgentName.value n) = Some id)))
+                        if taken then uniqueId () else id
                     { Id = uniqueId (); ShortId = shortId; Name = name; Aliases = []; Scope = endpoint.Scope
                       Binding = Bound(endpoint, now); FirstSeen = now }
             if registration.Aliases.Length > 64 then state, [ Decline(AliasLimit name) ]
@@ -191,15 +209,16 @@ module Router =
                 state, CompleteClaim(registration.Name, endpoint) :: delivery
 
     /// Every accepted send enters the outbox before IO, including bound recipients.
-    let send (now: DateTimeOffset) (limits: Limits) (scope: Scope) (from: AgentName) (request: SendRequest) (state: RouterState) : RouterState * Intent list =
+    let private sendWithSender (now: DateTimeOffset) (limits: Limits) (scope: Scope) (from: AgentName) (sender: Registration option) (request: SendRequest) (state: RouterState) : RouterState * Intent list =
         let state = expirePending now state
         let bytes = System.Text.Encoding.UTF8.GetByteCount request.Body
         let peers = state.Pending |> List.filter (fun mail -> mail.Purpose = PeerMessage)
-        let sender = RouterState.lookup scope from state
-        let recipient = RouterState.lookup scope request.To state
+        let resolution = RouterState.resolve scope request.To state
+        let recipient = resolution |> Result.toOption |> Option.flatten
         let mailboxPeers = peers |> List.filter (forAddress scope request.To state) |> List.length
         let self = match sender, recipient with Some a, Some b -> a.Id = b.Id | _ -> AgentName.equivalent from request.To
-        if self then state, [ Decline(SelfAddressed request.To) ]
+        if Result.isError resolution then state, [ Decline(AmbiguousAddress request.To) ]
+        elif self then state, [ Decline(SelfAddressed request.To) ]
         elif recipient.IsNone && (PeerAddress.tryParse(AgentName.value request.To) |> Option.isSome) then
             state, [ Decline(UnknownPeerAddress request.To) ]
         elif recipient.IsNone && (PeerId.tryParse(AgentName.value request.To) |> Option.isSome) then
@@ -226,6 +245,14 @@ module Router =
             | Some { Binding = Bound(endpoint = endpoint) } when not alreadyWaiting ->
                 prepareBacklog now endpoint state
             | _ -> state, [ Park(envelope, until) ]
+
+    /// Pure name-based entry point; production supplies the bound registration instead.
+    let send now limits scope from request state =
+        sendWithSender now limits scope from (RouterState.byName scope from state) request state
+
+    /// The engine resolves the actor by endpoint; display-name parsing cannot rewrite it.
+    let sendAs now limits (sender: Registration) request state =
+        sendWithSender now limits sender.Scope sender.Name (Some sender) request state
 
     /// Stable session-derived names are defaults, never substitutes for requested names.
     let announce now (endpoint: Endpoint) (state: RouterState) =

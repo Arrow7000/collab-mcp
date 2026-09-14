@@ -142,7 +142,10 @@ module StateWire =
                 registrations
             else
                 let mutable reserved = registrations |> Map.toSeq |> Seq.map snd |> Seq.collect (fun r ->
-                    seq { yield AgentName.key r.Name; yield! r.Aliases |> Seq.map AgentName.key }) |> Set.ofSeq
+                    seq {
+                        for n in r.Name :: r.Aliases do
+                            yield AgentName.key n
+                            yield! PeerAddress.tryParse(AgentName.value n) |> Option.toList }) |> Set.ofSeq
                 registrations |> Map.map (fun _ r ->
                     let mutable attempt = -1
                     let candidate () =
@@ -155,6 +158,13 @@ module StateWire =
                     reserved <- Set.add address reserved
                     { r with ShortId = address })
         let state = { Registrations = registrations; Pending = pending }
+        // Never commit a migration that would silently redirect a preserved address.
+        for _, registration in Map.toSeq registrations do
+            for address in registration.Name :: registration.Aliases do
+                match RouterState.resolve registration.Scope address state with
+                | Error(AmbiguousAddress _) ->
+                    failwith $"Ambiguous legacy address '{AgentName.value address}' in '{Scope.key registration.Scope}': a preserved name/alias matches another agent's ID. Database was not migrated. Rename that name/alias using the previous version or repair a backed-up snapshot before retrying."
+                | _ -> ()
         if version = 1 then
             // Pin routing IDs while leaving already-submitted synthetic text unchanged.
             let migrated = pending |> List.map (fun mail ->

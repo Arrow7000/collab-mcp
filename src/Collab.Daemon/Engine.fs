@@ -89,7 +89,7 @@ type Engine(clock: Clock, limits: Limits, ?store: StateStore) =
                             return! loop state
                         | Some caller ->
                             let state', intents =
-                                Router.send (clock.Now()) limits caller.Scope caller.Name request state
+                                Router.sendAs (clock.Now()) limits caller request state
 
                             match commit "send accepted" state state' with
                             | Ok saved -> reply.Reply(Ok(Decided intents)); return! loop saved

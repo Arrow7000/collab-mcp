@@ -29,7 +29,10 @@ for that live peer. `send` accepts a current name, a previous name, or a peer ID
 Messages include the sender ID as a reliable reply address. Short IDs use eight random
 hexadecimal digits and are checked for collisions before registration. The original
 full IDs and earlier `peer-…` short addresses remain valid for compatibility.
-Eight-character hex strings are reserved for IDs rather than display names. `oc2-`
+Eight-character hex strings are reserved for new ID addressing rather than new
+display names. Existing address-shaped names and aliases remain usable and may be
+restored by their owner. A name matching a different agent's ID is an explicit
+conflict; migration stops before writing rather than redirecting accepted addresses. `oc2-`
 identifies a generated OpenCode name, independent of model/provider. Generated names use two
 session-derived words and add a numeric suffix when a live name is already taken.
 

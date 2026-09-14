@@ -353,3 +353,21 @@ let ``automatic readable names avoid names already owned in the directory`` () =
     let state, _ = Router.announce now a occupied
     equal (AgentName.value generated + "-1") (AgentName.value (RouterState.boundTo a state).Value.Name)
     equal generated (RouterState.boundTo b state).Value.Name
+
+[<Theory>]
+[<InlineData(0)>]
+[<InlineData(1)>]
+[<InlineData(2)>]
+let ``ambiguous legacy addresses never redirect mail and do not rewrite the actor`` shape =
+    let recipient = (RouterState.boundTo b both).Value
+    let raw = match shape with 0 -> recipient.ShortId | 1 -> "peer-" + recipient.ShortId | _ -> PeerId.value recipient.Id
+    let sender = { (RouterState.boundTo a both).Value with Name = name raw }
+    let ambiguous = { both with Registrations = Map.add (PeerId.value sender.Id) sender both.Registrations }
+    equal (Error(AmbiguousAddress(name raw))) (RouterState.resolve a.Scope (name raw) ambiguous)
+    let unchanged, refused = Router.sendAs now Limits.defaults recipient { request "ambiguous" with To = name raw } ambiguous
+    equal ambiguous unchanged
+    equal [ Decline(AmbiguousAddress(name raw)) ] refused
+    let sent, _ = Router.sendAs now Limits.defaults sender (request "explicit actor") ambiguous
+    equal (Some sender.Id) sent.Pending.Head.Envelope.FromPeer
+    equal (Some sender.ShortId) sent.Pending.Head.Envelope.FromAddress
+    equal (Some recipient.Id) sent.Pending.Head.Envelope.ToPeer

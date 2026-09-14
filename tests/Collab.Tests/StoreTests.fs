@@ -248,3 +248,125 @@ let ``version three removes prefixes but preserves old addresses and submitted t
     let before = { state.Pending.Head.Envelope with FromAddress = Some("peer-" + original.ShortId) }
     equal (Collab.Adapters.OpenCode.Mapping.render before) (Collab.Adapters.OpenCode.Mapping.render migrated.Pending.Head.Envelope)
     equal migrated (StateWire.decode(StateWire.encode migrated))
+
+let private legacyNamedSnapshot (version: int) (raw: string) (alias: bool) =
+    let state = Router.claim now (name "Red") a RouterState.empty |> fst |> Router.claim now (name "Blue") b |> fst
+    let root = System.Text.Json.Nodes.JsonNode.Parse(StateWire.encode state)
+    root["version"] <- System.Text.Json.Nodes.JsonValue.Create version
+    for node in root["registrations"].AsArray() do
+        if node["name"].GetValue<string>() = "Red" then
+            if alias then
+                let aliases = System.Text.Json.Nodes.JsonArray()
+                aliases.Add(System.Text.Json.Nodes.JsonValue.Create raw)
+                node["aliases"] <- aliases
+            else node["name"] <- System.Text.Json.Nodes.JsonValue.Create raw
+        if version = 1 then
+            for key in [ "peerId"; "aliases"; "shortId" ] do node.AsObject().Remove key |> ignore
+        elif version = 2 then node.AsObject().Remove "shortId" |> ignore
+        elif version = 3 then
+            node["shortId"] <- System.Text.Json.Nodes.JsonValue.Create("peer-" + node["shortId"].GetValue<string>())
+    root.ToJsonString()
+
+[<Theory>]
+[<InlineData(1, "deadbeef")>]
+[<InlineData(1, "peer-deadbeef")>]
+[<InlineData(1, "peer-12345678000000000000000000000001")>]
+[<InlineData(2, "deadbeef")>]
+[<InlineData(2, "peer-deadbeef")>]
+[<InlineData(3, "deadbeef")>]
+[<InlineData(4, "deadbeef")>]
+let ``legacy ID shaped names stay addressable and preserve sender identity`` version raw =
+    let state = StateWire.decode(legacyNamedSnapshot version raw false)
+    let sender = (RouterState.boundTo a state).Value
+    equal (name raw) sender.Name
+    equal (Some sender) (RouterState.lookup a.Scope (name(raw.ToUpperInvariant())) state)
+    let repeated, intents = Router.claim now sender.Name a state
+    equal state repeated
+    equal [ CompleteClaim(sender.Name, a) ] intents
+    let sent, _ = Router.sendAs now Limits.defaults sender { To = name "Blue"; Body = "legacy sender"; Urgency = AtTurnBoundary } state
+    let envelope = sent.Pending.Head.Envelope
+    equal (Some sender.Id) envelope.FromPeer
+    equal (Some sender.ShortId) envelope.FromAddress
+    let received, _ = Router.send now Limits.defaults b.Scope (name "Blue") { To = name raw; Body = "legacy recipient"; Urgency = AtTurnBoundary } state
+    equal (Some sender.Id) received.Pending.Head.Envelope.ToPeer
+
+[<Theory>]
+[<InlineData(2, "deadbeef")>]
+[<InlineData(2, "peer-deadbeef")>]
+[<InlineData(3, "deadbeef")>]
+[<InlineData(4, "peer-12345678000000000000000000000001")>]
+let ``legacy ID shaped aliases survive rename and can become the name again`` version raw =
+    let state = StateWire.decode(legacyNamedSnapshot version raw true)
+    let original = (RouterState.boundTo a state).Value
+    equal (Some original) (RouterState.lookup a.Scope (name raw) state)
+    let renamed, _ = Router.claim now (name "Crimson") a state
+    let restored, intents = Router.claim now (name raw) a renamed
+    let peer = (RouterState.boundTo a restored).Value
+    equal original.Id peer.Id
+    equal (name raw) peer.Name
+    equal [ CompleteClaim(peer.Name, a) ] intents
+    equal (Some peer) (RouterState.lookup a.Scope (name raw) restored)
+    equal restored (StateWire.decode(StateWire.encode restored))
+
+[<Fact>]
+let ``legacy hex name migration persists and engine sender identity survives restart`` () = withDatabase (fun path ->
+    use storage = new SqliteStateStore(path)
+    let original = legacyNamedSnapshot 3 "deadbeef" false
+    do
+        use connection = new SqliteConnection($"Data Source={path}")
+        connection.Open()
+        use command = connection.CreateCommand()
+        command.CommandText <- "INSERT INTO state(id,payload) VALUES(1,$payload)"
+        command.Parameters.AddWithValue("$payload", original) |> ignore
+        command.ExecuteNonQuery() |> ignore
+    let engine = Engine(clock, Limits.defaults, store = storage)
+    let before = (run (engine.Roster a)).Caller.Value
+    match run (engine.Send(a, { To = name "Blue"; Body = "persisted legacy sender"; Urgency = AtTurnBoundary })) with
+    | Decided [ PushTo(_, envelope) ] ->
+        equal (Some before.Id) envelope.FromPeer
+        equal (Some before.ShortId) envelope.FromAddress
+    | result -> failwithf "unexpected %A" result
+    let restart = Engine(clock, Limits.defaults, store = storage)
+    let state = run (restart.Snapshot())
+    equal (Some before) (RouterState.lookup a.Scope (name "deadbeef") state)
+    equal (Some before.Id) state.Pending.Head.Envelope.FromPeer
+    use connection = new SqliteConnection($"Data Source={path}")
+    connection.Open()
+    use command = connection.CreateCommand()
+    command.CommandText <- "SELECT payload FROM state WHERE id=1"
+    let root = System.Text.Json.Nodes.JsonNode.Parse(string (command.ExecuteScalar()))
+    equal 4 (root["version"].GetValue<int>()))
+
+[<Fact>]
+let ``ambiguous legacy migration leaves database payload and audit unchanged`` () = withDatabase (fun path ->
+    use storage = new SqliteStateStore(path)
+    let root = System.Text.Json.Nodes.JsonNode.Parse(legacyNamedSnapshot 3 "deadbeef" false)
+    for node in root["registrations"].AsArray() do
+        if node["name"].GetValue<string>() = "Blue" then
+            node["shortId"] <- System.Text.Json.Nodes.JsonValue.Create "peer-deadbeef"
+    let payload = root.ToJsonString()
+    use connection = new SqliteConnection($"Data Source={path}")
+    connection.Open()
+    use command = connection.CreateCommand()
+    command.CommandText <- "INSERT INTO state(id,payload) VALUES(1,$payload)"
+    command.Parameters.AddWithValue("$payload", payload) |> ignore
+    command.ExecuteNonQuery() |> ignore
+    let error = Assert.ThrowsAny<Exception>(fun () -> (storage :> StateStore).Load() |> ignore)
+    Assert.Contains("Ambiguous legacy address 'deadbeef'", error.Message)
+    Assert.Contains("Database was not migrated", error.Message)
+    command.CommandText <- "SELECT payload FROM state WHERE id=1"
+    equal payload (string (command.ExecuteScalar()))
+    command.CommandText <- "SELECT COUNT(*) FROM audit"
+    equal 0L (command.ExecuteScalar() :?> int64))
+
+[<Fact>]
+let ``legacy prefixed hex alias reserves its normalized ID during allocation`` () =
+    let root = System.Text.Json.Nodes.JsonNode.Parse(legacyNamedSnapshot 2 "peer-12345678" true)
+    for node in root["registrations"].AsArray() do
+        if node["name"].GetValue<string>() = "Blue" then
+            node["peerId"] <- System.Text.Json.Nodes.JsonValue.Create "peer-12345678000000000000000000000001"
+    let state = StateWire.decode(root.ToJsonString())
+    let sender = (RouterState.boundTo a state).Value
+    let recipient = (RouterState.boundTo b state).Value
+    Assert.NotEqual<string>("12345678", recipient.ShortId)
+    equal (Some sender) (RouterState.lookup a.Scope (name "peer-12345678") state)

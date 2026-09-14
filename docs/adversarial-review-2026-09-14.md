@@ -60,3 +60,15 @@ Attribution's held-fact bound does not also bound outstanding waiters. This belo
 to the existing resource/traffic-limit work and should be included in its acceptance
 checks. `senderMustAct` was examined but is not a confirmed defect: its contract
 allows reporting/reconciliation, not just retry, and it has no current consumer.
+
+## Resolution
+
+The legacy-name finding is fixed in the subsequent implementation. Address resolution
+now considers names/aliases and IDs separately, preserves unambiguous legacy names,
+and refuses cross-identity ambiguity. Migration reports ambiguous addresses before
+saving, leaving the original payload and audit unchanged. Endpoint-bound sender
+registrations stamp provenance directly. Existing owners can repeat hello or restore
+an address-shaped alias; new claims still reserve ID syntax. Allocation accounts for
+normalized legacy address shapes. Regression coverage includes earlier snapshot
+versions, names/aliases, sender identity, actual SQLite migration/restart, and collision
+rejection without database changes.
