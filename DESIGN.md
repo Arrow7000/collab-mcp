@@ -328,6 +328,9 @@ the resulting activity. Backend transcript checks alone are insufficient.
   by session when present; refuse malformed/conflicting metadata.
 - [x] Filter observations to the collab server and retain endpoint identity in dedupe keys.
 - [x] Require runtime session metadata and remove argument-only attribution.
+- [ ] Reject obsolete lifecycle announcements after session deletion; cover delayed
+  eligibility finishing after deletion. See the Sol follow-up in the
+  [adversarial review](docs/adversarial-review-2026-09-14.md).
 - [x] Automatically register newly created/viewed/executing OC2 sessions with connected
   collab servers. Preserve explicit names; test two peers before any model/hello call.
 - [x] Demonstrate metadata-scoped attribution through the real shim/daemon in isolated
@@ -379,6 +382,9 @@ in the same transaction, bounding historical storage. The private database is `~
 (or the directory supplied by `COLLAB_MCP_HOME` for isolated runs).
 
 ### M3 — bounded operation and visible behaviour
+
+- [ ] Dispatch shared MCP shim requests with bounded concurrency and serialized
+  response writes; verify one slow tool does not block other sessions or ping.
 
 - [x] Bound outbox/mailboxes, message sizes, and audit snapshot retention.
 - [ ] Limit sender/recipient traffic and interrupts.

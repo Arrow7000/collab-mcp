@@ -2,7 +2,8 @@
 
 Reviewed commit: `0b23e75`. Reviewer: `gpt-5.6-terra`, high reasoning effort.
 Sol at medium effort was conditional on Terra finding no actionable issues; it was
-not launched because Terra confirmed the finding below.
+not launched during that initial review because Terra confirmed the finding below.
+The user subsequently requested Sol after the fix; that follow-up is recorded below.
 
 Review scope: original vision and roadmap, identity/addressing, migration and
 persistence, routing/delivery/recovery, attribution and concurrency, transport,
@@ -72,3 +73,64 @@ an address-shaped alias; new claims still reserve ID syntax. Allocation accounts
 normalized legacy address shapes. Regression coverage includes earlier snapshot
 versions, names/aliases, sender identity, actual SQLite migration/restart, and collision
 rejection without database changes.
+
+Validation of the fix: committed as `02303ac`; all 122 Release tests passed,
+Debug built without warnings or errors, and the two-real-OC2 scripted-provider
+identity/bidirectional delivery check passed. The original isolated reproduction
+now reports successful legacy-name lookup and preserved sender ID. The live daemon
+was updated while retaining all five existing names, IDs, and session bindings.
+
+## Sol follow-up — corrected version
+
+Reviewer: `gpt-5.6-sol`, medium reasoning effort. Reviewed commit: `02303ac`.
+Sol found no additional actionable defect in the legacy-name fix. It reported two
+additional P2 findings, both independently reproduced by the parent agent.
+No source changes were made during the review.
+
+### P2 — delayed automatic registration resurrects a deleted session
+
+Locations: `src/Collab.Daemon/Daemon.fs:338`, `:351`, `:353`;
+`src/Collab.Adapters.OpenCode/OpenCodeApi.fs:417`.
+
+Lifecycle announcements run in detached asynchronous work and may retry eligibility
+checks for the project's collab MCP registry. Deletion handling runs independently.
+That eligibility check establishes project connectivity, not session existence.
+
+Reproduction: register an endpoint, hold its next announcement eligibility response,
+process `SessionEnded`, then allow the delayed eligibility response to succeed.
+`engine.Announce` binds that same deleted endpoint again with a new ID. The sequence
+also resurrects an endpoint deleted before its first registration.
+
+Impact: the roster shows a dead agent and its generated name becomes reserved again.
+Both lifecycle events were received; this is a concurrency defect, not the already
+planned recovery from missed events.
+
+Correction: represent lifecycle ordering in the engine. Check a generation or deletion
+tombstone atomically before accepting automatic registration, and cancel or discard
+pending obsolete work. Test eligibility completing after deletion deterministically.
+A check outside the engine alone would still leave a check/registration race.
+
+### P2 — a slow tool call blocks every session sharing the shim
+
+Location: `src/Collab.Shim/Mcp.fs:203` (incorrect single-session assumption at `:165`).
+
+The stdio read loop runs each tool with `Async.RunSynchronously` before reading the
+next request. OC2 shares this MCP process across sessions. A slow attribution join or
+admission therefore blocks independent requests from other agents. The engine keeps
+IO outside its serialized decision loop, but the shim reintroduces that blocking.
+
+Reproduction: use a private fake Unix-socket daemon, start a roster request whose
+response is held, then send MCP ping on the same stdio stream. Ping has no response
+while the roster waits; it responds only after the fake daemon releases the tool.
+This was reproduced against the Release executable without touching live services.
+
+Impact: a lost-attribution call can block other agents' tools for ten seconds; a slow
+admission can block them for sixty seconds. Even an independent ping is delayed.
+
+Correction: use bounded concurrent request dispatch, serialize complete response
+writes, and retain JSON-RPC request IDs. Add a regression proving that an independent
+request completes while a tool waits, plus response framing/concurrency checks.
+
+Recommended next order: lifecycle ordering and deletion safety, then bounded shim
+concurrency. Re-run the two-agent integration check and adversarial regressions after
+these changes. Known roadmap omissions remain separate from these findings.
