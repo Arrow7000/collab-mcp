@@ -312,6 +312,9 @@ the resulting activity. Backend transcript checks alone are insufficient.
   Repeating hello with the same name is idempotent and preserves displayed spelling;
   renaming preserves the peer ID and reserves previous names as aliases. Another
   live owner blocks a claim. A new session may reuse released names with a new ID.
+- [ ] Preserve legacy address-shaped names/aliases during migration; prevent sender
+  provenance loss when a preserved name matches ID syntax. See the
+  [adversarial review](docs/adversarial-review-2026-09-14.md).
 - [x] Add durable peer IDs, safe renaming, and addressing by ID or reserved alias;
   migrate persisted state and verify actual OC2 rename/delivery.
 - [x] Add deterministic regression tests and include them in `dotnet test`.
