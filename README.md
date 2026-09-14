@@ -1,186 +1,183 @@
 # collab-mcp
 
-Peer-to-peer collaboration for coding agents across providers, with **push delivery**.
+**Let coding agents talk to each other—and wake each other up.**
 
-Agents address each other by name and are *woken* when mail arrives — including when
-idle. There is no `fetch_inbox`, because the inbox belongs to the runtime, not to the
-model.
+Open two agents in the same project. They appear in each other's roster automatically,
+get readable names and short stable IDs, and can send messages across harnesses and
+model providers. An incoming message wakes an idle agent; a normal message to a busy
+agent waits for its turn boundary. You can watch the resulting work stream in the
+agents' existing terminal UIs.
 
-- [`DESIGN.md`](DESIGN.md) — architecture, requirements, delivery semantics, and roadmap.
-- [`docs/findings-oc2.md`](docs/findings-oc2.md) — verified notes on the opencode2
-  process model that the design rests on. Read before touching the adapter.
+The model never has to check an inbox. It sends a message, ends its turn, and resumes
+when a reply arrives.
 
-## Agent-facing surface
-
-Three verbs. An agent supplies only a name for itself, and a recipient and body when
-writing. Its session and project are derived from the harness, never asked for.
-
-| Verb | Meaning |
-|---|---|
-| `hello(name)` | Choose or change your display name |
-| `roster()` | Who else is working in this project |
-| `send(to, body, urgency)` | Write to a peer; `urgency` is at-turn-boundary or interrupt |
-
-OC2 sessions with `collab` loaded register automatically with a stable generated
-`oc2-maple-otter` style name. No prompt to call `hello` is needed. `roster` shows peers and identifies
-your own entry, its short durable ID (for example `a1b2c3d4`), and previous names. `hello` can change the
-display name at any time; the ID stays the same. Previous names remain reserved aliases
-for that live peer. `send` accepts a current name, a previous name, or a peer ID.
-Messages include the sender ID as a reliable reply address. Short IDs use eight random
-hexadecimal digits and are checked for collisions before registration. The original
-full IDs and earlier `peer-…` short addresses remain valid for compatibility.
-Eight-character hex strings are reserved for new ID addressing rather than new
-display names. Existing address-shaped names and aliases remain usable and may be
-restored by their owner. A name matching a different agent's ID is an explicit
-conflict; migration stops before writing rather than redirecting accepted addresses. `oc2-`
-identifies a generated OpenCode name, independent of model/provider. Generated names use two
-session-derived words and add a numeric suffix when a live name is already taken.
-
-Registration follows session lifecycle events; a scoped tool call also repairs a missed
-registration. Cold-start gaps or reopening a conversation without a lifecycle event
-may delay presence until its next execution/tool call. Historical sessions are not
-registered wholesale. Definitive deletion is persisted by harness/session ID, so a
-delayed lifecycle event cannot re-register that session after deletion or restart.
-
-The shared MCP shim forwards up to 32 tool requests concurrently. Slow requests
-do not block other sessions or ping. Requests above that limit are rejected before
-forwarding, and response frames retain their request IDs.
-
-OC2 runtime session metadata is required on every tool call; project context comes from
-matching harness events. Claude uses its native per-session MCP environment. `send` takes no `from`, and agents supply no session or
-directory arguments. Missing, malformed or conflicting metadata is refused immediately.
-
-## Using it
-
-One line, and nothing to start by hand — the shim spawns the daemon on first use.
-
-```bash
-dotnet build
+```text
+Red [a1b2c3d4] → Blue [e5f60718]: Can you review the parser while I fix the router?
+Blue wakes, reviews it, and replies to a1b2c3d4.
+Red wakes and continues—with both conversations visible in their own terminals.
 ```
 
-Add this to `~/.config/opencode/opencode.json` (or a project-local `opencode.json`).
-Use an OC2 V2 build that supplies MCP `_meta.ai.opencode/sessionID` or `_meta.sessionID`.
-The installed beta-17519 lacks this context and is unsupported for tool calls. Keep the
-server key `collab`, which the adapter uses to isolate tool-progress events. OC2 2.0.3 was verified with the real shim and daemon in both tool modes.
+## Three tools
+
+| Tool | What it does |
+| --- | --- |
+| `roster()` | Lists agents in the current project, including yourself. |
+| `hello(name)` | Optionally chooses or changes your display name. |
+| `send(to, body, urgency?)` | Pushes a message to another agent. |
+
+`to` accepts a current name, previous name, or the eight-character hexadecimal ID
+shown by `roster`. IDs survive renaming, reconnecting, and daemon restarts. Previous
+names remain reserved aliases for that conversation, so renaming doesn't break
+ongoing exchanges. Incoming messages include the sender's ID for replies.
+
+Pi exposes these tools as `collab_roster`, `collab_hello`, and `collab_send` to avoid
+collisions with other extensions. MCP harnesses namespace them under the `collab` server.
+
+Names are scoped to the project directory. Start agents in the same directory to
+connect them; separate directories have separate rosters. Path aliases and symlinks
+are not automatically merged.
+
+## Supported harnesses
+
+This is an early working implementation, with real terminal integration checks.
+
+| Harness | Integration | Tested version | Incoming messages |
+| --- | --- | --- | --- |
+| **Pi** | Native extension | 0.85.1 | Custom agent messages; idle wake-up and busy follow-ups. |
+| **OpenCode 2** | MCP plus the native event/delivery API | 2.0.3 | Synthetic peer input; turn-boundary and interrupt delivery. |
+| **Claude Code** | MCP plus opt-in preview channels | 2.1.270 | Channel input; idle wake-up and busy follow-ups. |
+
+`at_turn_boundary` is the default urgency. `interrupt` is supported only for OC2
+recipients; Pi and Claude refuse it explicitly. Loading MCP tools alone does not
+provide push support in an arbitrary harness. Pi uses an extension to connect its
+running agent and UI to the same collaboration core.
+
+Codex and Grok Build are not supported yet. Investigation notes and remaining work
+live in [DESIGN.md](DESIGN.md#10-roadmap).
+
+## Get started
+
+Requires **.NET 10** and macOS or Linux; Pi also requires Node.js 22.19 or newer.
+Build from source:
+
+```bash
+git clone https://github.com/Arrow7000/collab-mcp.git
+cd collab-mcp
+dotnet build -c Release
+```
+
+The executable is `src/Collab.Shim/bin/Release/net10.0/collab-mcp`. Use its **absolute
+path** in harness configuration. No separate daemon launch is needed: the integration
+starts it automatically.
+
+### Pi
+
+Install Pi if needed, then install the local extension:
+
+```bash
+npm install -g @earendil-works/pi-coding-agent
+pi install /absolute/path/to/collab-mcp/integrations/pi
+```
+
+Open two Pi sessions from the same project directory. The status line shows each
+agent's generated name and ID; agents can call `roster` immediately. Ask one to send
+the other a message and end its turn.
+
+The extension finds the built executable in this checkout, preferring Release over
+Debug. Set `COLLAB_MCP_BINARY` to an absolute executable path if you keep it elsewhere.
+Pi must use saved sessions; `--no-session` is unsupported. An OpenCode installation
+is not required to use Pi.
+
+### OpenCode 2
+
+Merge this server into your user or project `opencode.json`:
 
 ```json
-{ "mcp": { "servers": { "collab": { "type": "local", "codemode": true,
-    "command": ["<repo>/src/Collab.Shim/bin/Debug/net10.0/collab-mcp"] } } } }
+{
+  "mcp": {
+    "servers": {
+      "collab": {
+        "type": "local",
+        "codemode": true,
+        "command": ["/absolute/path/to/collab-mcp/src/Collab.Shim/bin/Release/net10.0/collab-mcp"]
+      }
+    }
+  }
+}
 ```
 
-The daemon keeps its socket, lock, log and SQLite database under `~/.collab-mcp`.
+Keep the server name `collab`. Use an OC2 V2 build that supplies MCP session metadata
+(`ai.opencode/sessionID` or `sessionID`); the older beta-17519 is unsupported.
+Both Code Mode and direct-tool mode are tested. See [OC2 findings](docs/findings-oc2.md).
 
-Claude Code uses the same executable and daemon. Register the server, then launch
-an interactive session with the local development channel enabled:
+### Claude Code — experimental channels
+
+Claude push delivery currently requires Anthropic's **research-preview channel
+feature**, including its development-channel launch flag:
 
 ```bash
-claude mcp add --transport stdio --scope user collab -- <repo>/src/Collab.Shim/bin/Debug/net10.0/collab-mcp
+claude mcp add --transport stdio --scope user collab -- /absolute/path/to/collab-mcp/src/Collab.Shim/bin/Release/net10.0/collab-mcp
 claude --dangerously-load-development-channels server:collab
 ```
 
-Claude presents its own development-channel confirmation at launch. Keep the server
-name `collab`. A Claude session automatically gets a `claude-maple-otter` style name
-and the same bare stable ID format as OC2; `hello` can rename it. Start both harnesses
-in the same directory to share a roster. Claude 2.1.270 is the tested version.
-Channels require Anthropic authentication and any applicable organization channel
-policy. Loading the MCP tools alone does not enable push delivery.
-[Claude channel setup](https://code.claude.com/docs/en/channels).
+Claude presents its own confirmation at launch. The flag enables this local,
+unapproved development channel; it does not bypass tool permissions. Authentication
+and applicable organization channel policies still apply. A normal MCP-only launch
+is insufficient for push delivery. See [channel requirements](https://code.claude.com/docs/en/channels)
+and [our verified Claude findings](docs/findings-claude-code.md).
 
-Claude channel input appears separately in the terminal and wakes an idle session;
-busy sessions queue it for the next turn. Use `at_turn_boundary` for Claude recipients;
-`interrupt` is explicitly refused. Notifications are confirmed using the native
-durable queue/transcript, rather than treating a pipe write as delivered. Unconfirmed
-submissions remain owned by the outbox and are never blindly retried. Closing an MCP
-pipe does not delete a resumable Claude conversation or release its name. Internal
-Claude subagents sharing that MCP process are represented by its conversation, not
-registered as separate peers. Channel permission approval/relay is not enabled.
+## How it works
 
-The optional real-harness check uses private settings and local scripted providers:
+A small local daemon owns the shared identity registry, routing, and persistent
+outbox. Each adapter translates the same delivery contract into its harness's native
+input mechanism. Incoming messages retain agent provenance in the terminal and model
+context.
 
-```bash
-dotnet build -c Release
-python3 scripts/check-oc2.py --oc2 ~/.opencode/bin/opencode2 --mode claude
-```
+The daemon stores its Unix socket, log, and SQLite database in the private
+`~/.collab-mcp` directory. Accepted messages survive daemon restarts. A transport write
+alone is insufficient to declare delivery: adapters check native admission evidence.
+If the result is uncertain, the router retains ownership and does not blindly resend.
 
-Inspect an existing daemon without starting one:
+Inspect it with:
 
 ```bash
-<repo>/src/Collab.Shim/bin/Debug/net10.0/collab-mcp --status
+/absolute/path/to/collab-mcp/src/Collab.Shim/bin/Release/net10.0/collab-mcp --status
 ```
 
-Status reports the event-stream connection, bindings, and waiting/delivering/uncertain
-outbox counts. The log records connection failures and recovery activity. Set
-`COLLAB_MCP_HOME` to a separate directory for isolated runs.
+Set `COLLAB_MCP_HOME` for isolated state. Pi and Claude identities represent native
+conversations; closing a terminal does not imply deleting a resumable conversation.
+Harness-internal workers need their own supported session integration to appear
+individually.
 
-## State of play
-
-| Component | Status |
-|---|---|
-| `src/Collab.Domain` | P1 implemented; pure routing, parking and identity |
-| `src/Collab.Adapters.OpenCode` | P1 implemented: synthetic delivery and SSE observation |
-| `src/Collab.Daemon` | SQLite registry/outbox/audit, correlation, delivery acknowledgements, Unix socket |
-| `src/Collab.Shim` | P1 implemented: three tools, spawns the daemon |
-| `src/Collab.Adapters.ClaudeCode` | Native session attribution, MCP channel push, durable receipt reconciliation |
-
-`dotnet build` from the repo root builds all five runtime projects and the test project.
-`dotnet test` runs identity ownership and attribution regression suites, including
-concurrent claims through the daemon engine and session-scoped invocation matching.
-
-Names belong to one live session in each project. Repeating `hello` with your current
-name is harmless and preserves its spelling. Names and aliases owned by a different
-live session are refused. IDs survive renaming, terminal reconnection, and daemon
-restart. After session deletion, a new session may reuse a name but receives a new
-ID and does not inherit messages addressed to the previous peer. Names containing whitespace are rejected rather than trimmed.
-
-**P1 is demonstrated.** Two opencode2 agents on different providers — RedStone on
-`deepseek-v4-pro`, BlueJay on `google/gemini-3.8-flash` — in one project:
-
-```
-[user]      "…announce yourself as RedStone, then end your turn."
-[assistant] READY.                                          <- idle, nothing polling
-[synthetic] [peer BlueJay]: What is 6 times 7?              <- pushed in; woke it
-[assistant] (send 42 to BlueJay)
-```
-
-BlueJay, itself idle by then, was woken in turn by the reply. Neither agent polled,
-waited or looped; both were woken from idle, in both directions.
-
-Optional real-harness checks use a private server, temporary state, and a local
-scripted provider, so they need no model credentials:
+## Development and verification
 
 ```bash
-dotnet build -c Release
-python3 scripts/check-oc2.py --oc2 /path/to/opencode --mode codemode
-python3 scripts/check-oc2.py --oc2 /path/to/opencode --mode direct
-python3 scripts/check-oc2.py --oc2 /path/to/opencode --mode bootstrap
-python3 scripts/check-oc2.py --oc2 /path/to/opencode --mode identity
-python3 scripts/check-oc2.py --oc2 /path/to/opencode --mode tui
+dotnet test -c Release
+python3 scripts/check-pi.py
+python3 scripts/check-oc2.py --oc2 /path/to/opencode2 --mode pi
+python3 scripts/check-oc2.py --oc2 /path/to/opencode2 --mode claude
 ```
 
-OC2 2.0.3 passed these checks. Its open TUI showed externally injected idle/busy peer
-notices and streamed replies. See [the terminal findings](docs/findings-tui.md).
+The optional integration checks open actual TUIs with private settings and local
+scripted model providers. They require the relevant harnesses installed, but make
+no paid model calls. OC2 also has `bootstrap`, `identity`, `codemode`, `direct`, and
+`tui` check modes. CI runs the core tests on macOS and Linux.
 
-## Known limits
+- [DESIGN.md](DESIGN.md) contains the vision, architecture, delivery semantics, and roadmap.
+- [Harness findings](docs/) record verified APIs, behavior, and integration limits.
+- `src/Collab.Domain` holds the pure identity and routing core.
+- `src/Collab.Adapters.*` contains harness-specific transports.
+- `src/Collab.Daemon`, `src/Collab.Shim`, and `integrations/pi` connect the core to running agents.
 
-- Cold-start or disconnected event streams can lose a required project attribution
-  fact. Calls then time out without performing an action; socket readiness alone does
-  not guarantee event-stream readiness.
-- The installed OC2 beta lacks runtime session metadata and is refused. Newer V2
-  source supplies metadata, and 2.0.3 was verified end to end in both Code Mode and
-  direct-tool mode. Argument-only attribution has been removed. See
-  [the attribution findings](docs/findings-attribution.md).
-- Registry and accepted mail survive daemon restarts in a private SQLite database.
-  Lost admission responses and crashes during delivery retain uncertain mail without
-  automatic retries; an uncertain item blocks later mail to that recipient. Positive
-  matching inbox/transcript evidence clears it; absent evidence leaves it held.
-  Session reconciliation and safe retry of absent uncertain items remain unfinished. See [the roadmap in DESIGN.md](DESIGN.md#10-roadmap).
-- Messages are limited to 16 KiB of UTF-8 text; a mailbox holds at most 64 peer
-  messages. The global outbox allows 256 peer messages and reserves space for notices
-  within 512 items. The audit retains the last 64 state snapshots. Rate limits,
-  duplicate suppression and interrupt budgets remain unfinished.
+## Current limits
 
-## Working agreement
+Uncertain delivery with no positive native evidence can remain held indefinitely
+and block later messages to that recipient. Safe recovery from absent admission
+and cleanup of abandoned resumable conversations remain roadmap work. Pi's queued
+follow-ups are volatile until recorded in its native session; quitting before
+consumption can therefore leave a message held for confirmation.
 
-Type-driven: representation, modules, names and signatures first; bodies after. Prefer
-cutting scope to adding it — the safety machinery in DESIGN.md §8 is deliberately
-deferred until this works end to end.
+Messages are limited to 16 KiB, with bounded per-recipient and global outboxes.
+Peer provenance does not enforce a separate permission sandbox: file leases,
+permission isolation, and conflict prevention are future coordination work. Agents
+sharing a directory can still edit the same files unless they coordinate themselves.
