@@ -433,8 +433,8 @@ in the same transaction, bounding historical storage. The private database is `~
   deletion protection until old lifecycle/tool observations cannot reappear.
   Claude bridge shutdown is a transport outage, not definitive conversation deletion;
   define retirement for abandoned resumable conversations without breaking identity.
-- [x] Add fake HTTP/SSE integration tests, an optional real OC2 check script, and Linux/macOS CI checks.
-  CI configuration is added to the working tree; hosted execution is unverified.
+- [x] Add fake HTTP/SSE integration tests, real-harness check scripts, and Linux/macOS
+  CI checks. Hosted core and real-Pi checks pass on both platforms.
 - [x] Verify a real OC2 2.0.3 TUI displays idle/busy queue triggers and streams replies
   without user prompts, using a scripted local provider. Busy mail does not overtake.
 - [ ] Complete visual/tool/permission/steer and return-to-idle checks beyond terminal

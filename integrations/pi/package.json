@@ -3,6 +3,14 @@
   "version": "0.1.0",
   "private": true,
   "description": "Push collaboration for Pi coding agents through collab-mcp",
+  "keywords": ["pi-package", "mcp", "multi-agent", "collaboration"],
+  "repository": "github:Arrow7000/collab-mcp",
+  "license": "UNLICENSED",
   "type": "module",
-  "pi": { "extensions": ["./index.ts"] }
+  "pi": { "extensions": ["./index.ts"] },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*"
+  }
 }

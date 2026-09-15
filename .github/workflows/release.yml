@@ -1,0 +1,112 @@
+name: release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+      - run: dotnet test --configuration Release --nologo
+
+  build:
+    needs: verify
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            rid: linux-x64
+          - runner: ubuntu-24.04-arm
+            rid: linux-arm64
+          - runner: macos-15-intel
+            rid: osx-x64
+          - runner: macos-15
+            rid: osx-arm64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+      - name: Validate release tag
+        shell: bash
+        run: |
+          [[ "$GITHUB_REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+      - name: Publish self-contained executable
+        shell: bash
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          dotnet publish src/Collab.Shim/Collab.Shim.fsproj \
+            --configuration Release \
+            --runtime "${{ matrix.rid }}" \
+            --self-contained true \
+            --output publish \
+            -p:Version="$version" \
+            -p:PublishSingleFile=true \
+            -p:IncludeNativeLibrariesForSelfExtract=true \
+            -p:EnableCompressionInSingleFile=true \
+            -p:DebugType=None \
+            -p:DebugSymbols=false
+          chmod 755 publish/collab-mcp
+      - name: Smoke-test native executable
+        shell: bash
+        run: |
+          smoke_home="$RUNNER_TEMP/collab-smoke"
+          mkdir -p "$smoke_home"
+          COLLAB_MCP_HOME="$smoke_home" ./publish/collab-mcp --daemon > smoke-daemon.txt 2>&1 &
+          daemon_pid=$!
+          trap 'kill -TERM "$daemon_pid" 2>/dev/null || true' EXIT
+          ready=false
+          for _ in {1..100}; do
+            if COLLAB_MCP_HOME="$smoke_home" ./publish/collab-mcp --status > smoke-status.txt 2>&1; then
+              ready=true
+              break
+            fi
+            if ! kill -0 "$daemon_pid" 2>/dev/null; then
+              cat smoke-daemon.txt
+              exit 1
+            fi
+            sleep 0.1
+          done
+          test "$ready" = true
+          grep -F "Registrations: 0 (0 bound)" smoke-status.txt
+          grep -F "Outbox: 0 waiting, 0 delivering, 0 uncertain" smoke-status.txt
+          kill -TERM "$daemon_pid"
+          wait "$daemon_pid" || true
+          trap - EXIT
+      - name: Archive
+        shell: bash
+        run: |
+          archive="collab-mcp-${GITHUB_REF_NAME}-${{ matrix.rid }}.tar.gz"
+          tar -C publish -czf "$archive" collab-mcp
+      - uses: actions/upload-artifact@v4
+        with:
+          name: collab-mcp-${{ matrix.rid }}
+          path: collab-mcp-${{ github.ref_name }}-${{ matrix.rid }}.tar.gz
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: collab-mcp-*
+          path: dist
+          merge-multiple: true
+      - name: Create checksums
+        working-directory: dist
+        run: sha256sum collab-mcp-*.tar.gz > SHA256SUMS
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" --verify-tag --generate-notes --title "$GITHUB_REF_NAME"

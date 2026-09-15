@@ -55,10 +55,30 @@ running agent and UI to the same collaboration core.
 Codex and Grok Build are not supported yet. Investigation notes and remaining work
 live in [DESIGN.md](DESIGN.md#10-roadmap).
 
-## Get started
+## Install
 
-Requires **.NET 10** and macOS or Linux; Pi also requires Node.js 22.19 or newer.
-Build from source:
+Download the self-contained archive for your machine from
+[GitHub Releases](https://github.com/Arrow7000/collab-mcp/releases/latest). It includes
+the .NET runtime; installing the .NET SDK is unnecessary.
+
+```bash
+# Choose one: linux-x64, linux-arm64, osx-x64, osx-arm64
+VERSION=v0.1.0
+PLATFORM=osx-arm64
+ARCHIVE="collab-mcp-${VERSION}-${PLATFORM}.tar.gz"
+
+curl -fLO "https://github.com/Arrow7000/collab-mcp/releases/download/${VERSION}/${ARCHIVE}"
+curl -fLO "https://github.com/Arrow7000/collab-mcp/releases/download/${VERSION}/SHA256SUMS"
+grep " ${ARCHIVE}$" SHA256SUMS | shasum -a 256 --check
+tar -xzf "$ARCHIVE"
+mkdir -p "$HOME/.local/bin"
+install -m 755 collab-mcp "$HOME/.local/bin/collab-mcp"
+```
+
+Ensure `$HOME/.local/bin` is on the `PATH` inherited by your coding-agent process.
+No separate daemon launch is needed: the integration starts it automatically.
+
+Developers building from source need **.NET 10**:
 
 ```bash
 git clone https://github.com/Arrow7000/collab-mcp.git
@@ -66,9 +86,7 @@ cd collab-mcp
 dotnet build -c Release
 ```
 
-The executable is `src/Collab.Shim/bin/Release/net10.0/collab-mcp`. Use its **absolute
-path** in harness configuration. No separate daemon launch is needed: the integration
-starts it automatically.
+The source-build executable is `src/Collab.Shim/bin/Release/net10.0/collab-mcp`.
 
 ### Pi
 
@@ -83,8 +101,8 @@ Open two Pi sessions from the same project directory. The status line shows each
 agent's generated name and ID; agents can call `roster` immediately. Ask one to send
 the other a message and end its turn.
 
-The extension finds the built executable in this checkout, preferring Release over
-Debug. Set `COLLAB_MCP_BINARY` to an absolute executable path if you keep it elsewhere.
+The extension finds a built executable in this checkout or `collab-mcp` on `PATH`.
+Set `COLLAB_MCP_BINARY` to an absolute executable path to override discovery.
 Pi must use saved sessions; `--no-session` is unsupported. An OpenCode installation
 is not required to use Pi.
 
@@ -99,7 +117,7 @@ Merge this server into your user or project `opencode.json`:
       "collab": {
         "type": "local",
         "codemode": true,
-        "command": ["/absolute/path/to/collab-mcp/src/Collab.Shim/bin/Release/net10.0/collab-mcp"]
+        "command": ["collab-mcp"]
       }
     }
   }
@@ -116,7 +134,7 @@ Claude push delivery currently requires Anthropic's **research-preview channel
 feature**, including its development-channel launch flag:
 
 ```bash
-claude mcp add --transport stdio --scope user collab -- /absolute/path/to/collab-mcp/src/Collab.Shim/bin/Release/net10.0/collab-mcp
+claude mcp add --transport stdio --scope user collab -- collab-mcp
 claude --dangerously-load-development-channels server:collab
 ```
 
@@ -125,6 +143,33 @@ unapproved development channel; it does not bypass tool permissions. Authenticat
 and applicable organization channel policies still apply. A normal MCP-only launch
 is insufficient for push delivery. See [channel requirements](https://code.claude.com/docs/en/channels)
 and [our verified Claude findings](docs/findings-claude-code.md).
+
+## Distribution roadmap
+
+- [x] Publish the source and run the core and real-Pi checks on macOS and Linux.
+- [x] Build self-contained `linux-x64`, `linux-arm64`, `osx-x64`, and `osx-arm64`
+  executables on native GitHub runners for version tags; smoke-test each executable
+  and publish SHA-256 checksums with the GitHub Release.
+- [ ] Choose and add the project license before publishing through package registries.
+- [ ] Publish an npm launcher/package that selects and verifies the matching native
+  binary. This gives MCP clients a stable `npx` command and supplies the package
+  artifact referenced by the official MCP Registry.
+- [ ] Publish the Pi extension as an npm Pi package with the `pi-package` keyword,
+  so installation becomes `pi install npm:<package>` and it appears in Pi's catalog.
+- [ ] Add `server.json` for `io.github.arrow7000/collab-mcp`, validate it with
+  `mcp-publisher`, publish it to the official MCP Registry, and check downstream
+  catalog ingestion. The registry stores metadata; the installable package must
+  already exist in a package registry.
+- [ ] Ship a Homebrew formula for a one-command native installation and upgrades.
+- [ ] Package the Claude integration as a Claude Code plugin and marketplace entry.
+  Test installation from a clean profile before submitting it to Anthropic's official
+  plugin marketplace. Full push delivery must still state and satisfy the channel
+  preview/approval requirement.
+- [ ] Add release signing/provenance, clean-machine install and upgrade tests, and
+  documented uninstall/rollback before calling distribution stable.
+
+The [engineering roadmap](DESIGN.md#10-roadmap) remains in `DESIGN.md`; this checklist
+tracks how the finished adapters reach users.
 
 ## How it works
 
@@ -141,7 +186,7 @@ If the result is uncertain, the router retains ownership and does not blindly re
 Inspect it with:
 
 ```bash
-/absolute/path/to/collab-mcp/src/Collab.Shim/bin/Release/net10.0/collab-mcp --status
+collab-mcp --status
 ```
 
 Set `COLLAB_MCP_HOME` for isolated state. Pi and Claude identities represent native
