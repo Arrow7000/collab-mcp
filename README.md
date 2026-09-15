@@ -1,114 +1,73 @@
 # collab-mcp
 
-**Let coding agents talk to each other—and wake each other up.**
+**Let coding agents in one project talk to each other and wake each other up.**
 
-Open two agents in the same project. They appear in each other's roster automatically,
-get readable names and short stable IDs, and can send messages across harnesses and
-model providers. An incoming message wakes an idle agent; a normal message to a busy
-agent waits for its turn boundary. You can watch the resulting work stream in the
-agents' existing terminal UIs.
-
-The model never has to check an inbox. It sends a message, ends its turn, and resumes
-when a reply arrives.
+Start two supported coding-agent sessions in the same project directory. They join a shared roster automatically, receive readable names and stable short IDs, and can send each other messages. A message wakes an idle recipient; a message for a busy recipient is delivered at an appropriate point in its work. The conversation stays visible in each harness's existing terminal UI.
 
 ```text
-Red [a1b2c3d4] → Blue [e5f60718]: Can you review the parser while I fix the router?
+Red [a1b2c3d4] → Blue [e5f60718]: Please review the parser while I fix the router.
 Blue wakes, reviews it, and replies to a1b2c3d4.
-Red wakes and continues—with both conversations visible in their own terminals.
+Red wakes and continues.
 ```
 
-## Three tools
+## Compatibility and project status
 
-| Tool | What it does |
-| --- | --- |
-| `roster()` | Lists agents in the current project, including yourself. |
-| `hello(name)` | Optionally chooses or changes your display name. |
-| `send(to, body, urgency?)` | Pushes a message to another agent. |
-
-`to` accepts a current name, previous name, or the eight-character hexadecimal ID
-shown by `roster`. IDs survive renaming, reconnecting, and daemon restarts. Previous
-names remain reserved aliases for that conversation, so renaming doesn't break
-ongoing exchanges. Incoming messages include the sender's ID for replies.
-
-Pi exposes these tools as `collab_roster`, `collab_hello`, and `collab_send` to avoid
-collisions with other extensions. MCP harnesses namespace them under the `collab` server.
-
-Names are scoped to the project directory. Start agents in the same directory to
-connect them; separate directories have separate rosters. Path aliases and symlinks
-are not automatically merged.
-
-## Supported harnesses
-
-This is an early working implementation, with real terminal integration checks.
+collab-mcp is an early implementation. The versions listed below have real terminal
+integration checks.
 
 | Harness | Integration | Tested version | Incoming messages |
 | --- | --- | --- | --- |
-| **Pi** | Native extension | 0.85.1 | Custom agent messages; idle wake-up and busy follow-ups. |
-| **OpenCode 2** | MCP plus the native event/delivery API | 2.0.3 | Synthetic peer input; turn-boundary and interrupt delivery. |
-| **Claude Code** | MCP plus opt-in preview channels | 2.1.270 | Channel input; idle wake-up and busy follow-ups. |
+| **Pi** | Native extension | 0.85.1 | Wakes while idle; messages received while working are queued for a follow-up. |
+| **OpenCode 2** | MCP integration | 2.0.3 | Wakes while idle; supports delivery at a turn boundary and interruption. |
+| **Claude Code** | MCP plus preview channels | 2.1.270 | Wakes while idle; messages received while working are queued for a follow-up. |
 
-`at_turn_boundary` is the default urgency. `interrupt` is supported only for OC2
-recipients; Pi and Claude refuse it explicitly. Loading MCP tools alone does not
-provide push support in an arbitrary harness. Pi uses an extension to connect its
-running agent and UI to the same collaboration core.
+Agents must start in the same directory to share a roster. Separate directories have separate rosters; path aliases and symlinks are not automatically merged.
 
-Codex and Grok Build are not supported yet. Investigation notes and remaining work
-live in [DESIGN.md](DESIGN.md#10-roadmap).
+Claude Code support is experimental because push delivery depends on Anthropic's research-preview channel feature. A standard MCP-only setup does not provide push delivery. Codex and Grok Build are not supported yet.
 
-## Install
+> **License status:** no project license has been specified. This is an unresolved
+> project-owner decision, not an installation or README configuration issue.
 
-Download the self-contained archive for your machine from
-[GitHub Releases](https://github.com/Arrow7000/collab-mcp/releases/latest). It includes
-the .NET runtime; installing the .NET SDK is unnecessary.
+Distribution and engineering plans are in [DESIGN.md](DESIGN.md#10-roadmap).
 
-```bash
-# Choose one: linux-x64, linux-arm64, osx-x64, osx-arm64
-VERSION=v0.1.0
-PLATFORM=osx-arm64
-ARCHIVE="collab-mcp-${VERSION}-${PLATFORM}.tar.gz"
+## First collaboration
 
-curl -fLO "https://github.com/Arrow7000/collab-mcp/releases/download/${VERSION}/${ARCHIVE}"
-curl -fLO "https://github.com/Arrow7000/collab-mcp/releases/download/${VERSION}/SHA256SUMS"
-grep " ${ARCHIVE}$" SHA256SUMS | shasum -a 256 --check
-tar -xzf "$ARCHIVE"
-mkdir -p "$HOME/.local/bin"
-install -m 755 collab-mcp "$HOME/.local/bin/collab-mcp"
+1. Download the self-contained archive for your machine from [GitHub Releases](https://github.com/Arrow7000/collab-mcp/releases/latest), unpack it, and put `collab-mcp` somewhere on the `PATH` inherited by your coding-agent process. Choose the archive matching your platform: `linux-x64`, `linux-arm64`, `osx-x64`, or `osx-arm64`.
+2. Configure one supported harness below. Pi also needs a repository checkout because its local extension is installed from that checkout.
+3. Start fresh sessions of that harness in the same project directory after configuring it. No separate daemon launch is needed; the integration starts it automatically.
+4. Ask one agent to call its roster tool, then send the other agent a message. Let the sending agent finish its response so the harness can return control to the session.
+
+```text
+roster()  →  Red [a1b2c3d4], Blue [e5f60718]
+send(to: "Blue", body: "Please review the parser while I fix the router.")
 ```
 
-Ensure `$HOME/.local/bin` is on the `PATH` inherited by your coding-agent process.
-No separate daemon launch is needed: the integration starts it automatically.
-
-Developers building from source need **.NET 10**:
-
-```bash
-git clone https://github.com/Arrow7000/collab-mcp.git
-cd collab-mcp
-dotnet build -c Release
-```
-
-The source-build executable is `src/Collab.Shim/bin/Release/net10.0/collab-mcp`.
+Blue receives the request in its terminal. If Blue is idle, it wakes; if it is
+working, the message is queued for the applicable delivery point. Blue can reply
+using Red's displayed ID.
 
 ### Pi
 
-Install Pi if needed, then install the local extension:
+Pi has two installation pieces: a **repository checkout** supplies the local
+extension, while the `collab-mcp` executable may be the self-contained binary you
+downloaded from Releases. These are separate paths. Clone the checkout, then install
+Pi's extension from its `integrations/pi` directory:
 
 ```bash
+git clone https://github.com/Arrow7000/collab-mcp.git
 npm install -g @earendil-works/pi-coding-agent
 pi install /absolute/path/to/collab-mcp/integrations/pi
 ```
 
-Open two Pi sessions from the same project directory. The status line shows each
-agent's generated name and ID; agents can call `roster` immediately. Ask one to send
-the other a message and end its turn.
+Start two new saved Pi sessions from the same project directory. Their status lines
+show the generated name and ID, which confirms that the collaboration identity is
+present. Pi's tools are named `collab_roster`, `collab_hello`, and `collab_send`.
 
-The extension finds a built executable in this checkout or `collab-mcp` on `PATH`.
-Set `COLLAB_MCP_BINARY` to an absolute executable path to override discovery.
-Pi must use saved sessions; `--no-session` is unsupported. An OpenCode installation
-is not required to use Pi.
+The extension finds a built executable in this checkout or `collab-mcp` on `PATH`. Set `COLLAB_MCP_BINARY` to an absolute executable path to override discovery. Pi must use saved sessions; `--no-session` is unsupported. An OpenCode installation is not required.
 
 ### OpenCode 2
 
-Merge this server into your user or project `opencode.json`:
+Add this server to your user or project `opencode.json`:
 
 ```json
 {
@@ -124,105 +83,87 @@ Merge this server into your user or project `opencode.json`:
 }
 ```
 
-Keep the server name `collab`. Use an OC2 V2 build that supplies MCP session metadata
-(`ai.opencode/sessionID` or `sessionID`); the older beta-17519 is unsupported.
-Both Code Mode and direct-tool mode are tested. See [OC2 findings](docs/findings-oc2.md).
+Keep the server name `collab`. Start a fresh OpenCode 2 session after changing the
+configuration, then confirm that its MCP tools include the `collab` server and call
+`roster()` to confirm the session identity. Use an OC2 V2 build that supplies MCP
+session metadata (`ai.opencode/sessionID` or `sessionID`); the older beta-17519 is
+unsupported. Both Code Mode and direct-tool mode are tested. See
+[OC2 findings](docs/findings-oc2.md).
 
-### Claude Code — experimental channels
+### Claude Code (preview)
 
-Claude push delivery currently requires Anthropic's **research-preview channel
-feature**, including its development-channel launch flag:
+Claude Code support is experimental. Push delivery requires Anthropic's
+research-preview channel feature and its development-channel launch flag:
 
 ```bash
 claude mcp add --transport stdio --scope user collab -- collab-mcp
 claude --dangerously-load-development-channels server:collab
 ```
 
-Claude presents its own confirmation at launch. The flag enables this local,
-unapproved development channel; it does not bypass tool permissions. Authentication
-and applicable organization channel policies still apply. A normal MCP-only launch
-is insufficient for push delivery. See [channel requirements](https://code.claude.com/docs/en/channels)
-and [our verified Claude findings](docs/findings-claude-code.md).
+Claude shows its own confirmation at launch. Start a fresh Claude session with the
+server after adding the configuration, then confirm that the `collab` tools are
+available and call `roster()`. The flag enables this local, unapproved development
+channel; authentication and applicable organization channel policies still apply.
+See [Claude's channel requirements](https://code.claude.com/docs/en/channels) and
+[verified Claude findings](docs/findings-claude-code.md).
 
-## Distribution roadmap
+## Tool reference
 
-- [x] Publish the source and run the core and real-Pi checks on macOS and Linux.
-- [x] Build self-contained `linux-x64`, `linux-arm64`, `osx-x64`, and `osx-arm64`
-  executables on native GitHub runners for version tags; smoke-test each executable
-  and publish SHA-256 checksums with the GitHub Release.
-- [ ] Choose and add the project license before publishing through package registries.
-- [ ] Publish an npm launcher/package that selects and verifies the matching native
-  binary. This gives MCP clients a stable `npx` command and supplies the package
-  artifact referenced by the official MCP Registry.
-- [ ] Publish the Pi extension as an npm Pi package with the `pi-package` keyword,
-  so installation becomes `pi install npm:<package>` and it appears in Pi's catalog.
-- [ ] Add `server.json` for `io.github.arrow7000/collab-mcp`, validate it with
-  `mcp-publisher`, publish it to the official MCP Registry, and check downstream
-  catalog ingestion. The registry stores metadata; the installable package must
-  already exist in a package registry.
-- [ ] Ship a Homebrew formula for a one-command native installation and upgrades.
-- [ ] Package the Claude integration as a Claude Code plugin and marketplace entry.
-  Test installation from a clean profile before submitting it to Anthropic's official
-  plugin marketplace. Full push delivery must still state and satisfy the channel
-  preview/approval requirement.
-- [ ] Add release signing/provenance, clean-machine install and upgrade tests, and
-  documented uninstall/rollback before calling distribution stable.
+MCP harnesses expose the tools under the `collab` server. Pi uses the prefixed tool names listed above to avoid extension-name collisions.
 
-The [engineering roadmap](DESIGN.md#10-roadmap) remains in `DESIGN.md`; this checklist
-tracks how the finished adapters reach users.
+| Tool | Inputs | Accepted formats and behavior |
+| --- | --- | --- |
+| `roster()` | None | Lists the agents currently connected to this project, including the caller. Each entry includes a display name and an eight-character hexadecimal ID. |
+| `hello(name)` | `name`: string | Optionally sets or changes the caller's display name. Names must be 1–64 characters and may contain letters, digits, hyphens, and underscores; whitespace-only names are rejected. |
+| `send(to, body, urgency?)` | `to`: string; `body`: string; `urgency`: optional string | `to` accepts the current displayed name from `roster()`, any prior name retained as an alias, or an eight-character hexadecimal roster ID. Names and IDs match case-insensitively. `body` accepts any string, including an empty or multiline string, up to 16 KiB of UTF-8-encoded bytes. `urgency` accepts `at_turn_boundary` (the default) or `interrupt`. `interrupt` is available only when the recipient uses OpenCode 2; Pi and Claude Code reject it explicitly. |
 
-## How it works
+IDs survive renaming, reconnecting, and daemon restarts. Previous names remain reserved aliases for that conversation, so an ongoing exchange is not broken by a rename. Incoming messages include the sender's ID for replies.
 
-A small local daemon owns the shared identity registry, routing, and persistent
-outbox. Each adapter translates the same delivery contract into its harness's native
-input mechanism. Incoming messages retain agent provenance in the terminal and model
-context.
+`at_turn_boundary` lets a busy agent complete its current turn before the message is delivered. `interrupt` asks OpenCode 2 to deliver immediately. An idle recipient is woken when a message arrives.
 
-The daemon stores its Unix socket, log, and SQLite database in the private
-`~/.collab-mcp` directory. Accepted messages survive daemon restarts. A transport write
-alone is insufficient to declare delivery: adapters check native admission evidence.
-If the result is uncertain, the router retains ownership and does not blindly resend.
+## What to expect
 
-Inspect it with:
+collab-mcp runs a small local service that keeps the roster, routes messages, and retains accepted messages across service restarts. It stores its Unix socket, log, and SQLite database in the private `~/.collab-mcp` directory. Check it with:
 
 ```bash
 collab-mcp --status
 ```
 
-Set `COLLAB_MCP_HOME` for isolated state. Pi and Claude identities represent native
-conversations; closing a terminal does not imply deleting a resumable conversation.
-Harness-internal workers need their own supported session integration to appear
-individually.
+Set `COLLAB_MCP_HOME` to use isolated state. Pi and Claude identities represent native conversations, so closing a terminal does not delete a resumable conversation. Harness-internal workers need their own supported session integration to appear separately.
 
-## Development and verification
+## Current limits
+
+If a harness has not confirmed accepting a message, it can remain held and later
+messages to that recipient can wait behind it. The service checks again every
+10 seconds and clears the hold only after the harness provides positive acceptance
+evidence. Resuming or restarting the recipient can make that evidence available, but
+does not guarantee recovery. Use `collab-mcp --status` to see counts of waiting,
+delivering, and uncertain messages; there is currently no manual retry or drop
+command. Pi follow-ups are not durable until Pi records them in its native session,
+so quitting before they are consumed can leave a message awaiting confirmation.
+
+Messages have bounded per-recipient and global outboxes. Collaboration does not add
+file leases, permission isolation, or conflict prevention: agents sharing a directory
+can still edit the same files unless they coordinate. See [DESIGN.md](DESIGN.md) for
+the delivery model and protocol-level design.
+
+## Contributing
+
+Build from source and run the core checks:
 
 ```bash
+git clone https://github.com/Arrow7000/collab-mcp.git
+cd collab-mcp
+dotnet build -c Release
 dotnet test -c Release
+```
+
+The source-build executable is `src/Collab.Shim/bin/Release/net10.0/collab-mcp`. For harness work, the optional checks use real terminal UIs with private settings and local scripted model providers, with no paid model calls:
+
+```bash
 python3 scripts/check-pi.py
 python3 scripts/check-oc2.py --oc2 /path/to/opencode2 --mode pi
 python3 scripts/check-oc2.py --oc2 /path/to/opencode2 --mode claude
 ```
 
-The optional integration checks open actual TUIs with private settings and local
-scripted model providers. They require the relevant harnesses installed, but make
-no paid model calls. OC2 also has `bootstrap`, `identity`, `codemode`, `direct`, and
-`tui` check modes. CI runs the core tests on macOS and Linux.
-
-- [DESIGN.md](DESIGN.md) contains the vision, architecture, delivery semantics, and roadmap.
-- [Harness findings](docs/) record verified APIs, behavior, and integration limits.
-- `src/Collab.Domain` holds the pure identity and routing core.
-- `src/Collab.Adapters.*` contains harness-specific transports.
-- `src/Collab.Daemon`, `src/Collab.Shim`, and `integrations/pi` connect the core to running agents.
-
-## Current limits
-
-Uncertain delivery with no positive native evidence can remain held indefinitely
-and block later messages to that recipient. Safe recovery from absent admission
-and cleanup of abandoned resumable conversations remain roadmap work. Pi's queued
-follow-ups are volatile until recorded in its native session; quitting before
-consumption can therefore leave a message held for confirmation.
-
-Messages are limited to 16 KiB, with bounded per-recipient and global outboxes.
-Peer provenance does not enforce a separate permission sandbox: file leases,
-permission isolation, and conflict prevention are future coordination work. Agents
-sharing a directory can still edit the same files unless they coordinate themselves.
+[DESIGN.md](DESIGN.md) describes the architecture, delivery semantics, and planned work. [Harness findings](docs/) record verified APIs, behavior, and integration limits.
